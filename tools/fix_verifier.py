@@ -148,8 +148,9 @@ class FixVerifier:
             elif incident_type == "argocd":
                 check_result = await self._verify_argocd_fix(expected_state)
             else:
-                check_result["details"]["note"] = "Generic verification performed"
-                check_result["passed"] = True
+                check_result["message"] = (
+                    f"Verification is not implemented for incident type '{incident_type}'"
+                )
         
         except Exception as e:
             log.error(f"Immediate verification failed", error=str(e))
@@ -265,9 +266,9 @@ class FixVerifier:
                 else:
                     result["message"] = f"Pod is {pod_status}, expected {expected_status}"
             else:
-                # Generic K8s verification
-                result["passed"] = True
-                result["message"] = "K8s state check passed"
+                result["message"] = (
+                    "K8s verification requires pod_name and namespace from the target system"
+                )
         
         except Exception as e:
             result["error"] = str(e)
@@ -349,8 +350,9 @@ class FixVerifier:
                 result["passed"] = service_running
                 result["message"] = f"Service is {'running' if service_running else 'not running'}"
             else:
-                result["passed"] = True
-                result["message"] = "Server state verified"
+                result["message"] = (
+                    "Server verification requires service_name from the target system"
+                )
         
         except Exception as e:
             result["error"] = str(e)
