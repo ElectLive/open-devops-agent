@@ -269,9 +269,23 @@ curl "$AGENT/audit?org_id=acme-corp"
 
 ---
 
+## Edge middleware (optional)
+
+If the central agent is not reachable from Alertmanager/CI (or cannot SSH into a VPC), deploy the thin connector in [`middleware/`](../middleware/):
+
+```text
+alerts → middleware → central agent
+agent  → middleware /exec → allowlisted local commands (optional)
+```
+
+See [`middleware/README.md`](../middleware/README.md). You still run the open-source agent **once**; hosts only need the middleware.
+
+---
+
 ## Related
 
 - [E2E EC2 Docker Test](E2E_EC2_DOCKER_TEST.md) — same-host variant
 - [Deployment](DEPLOYMENT.md)
 - [Organizational Guide](ORGANIZATIONAL_GUIDE.md)
 - [API Reference](API_REFERENCE.md)
+- [Edge middleware](../middleware/README.md)
