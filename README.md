@@ -34,37 +34,20 @@ This agent is your **24/7 on-call teammate** that handles:
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                     Alert Sources                                 │
-│  GitHub Actions · Alertmanager · PagerDuty · Manual /webhook     │
-└────────────────────────────┬─────────────────────────────────────┘
-                             │  POST /webhook/*
-                             ▼
-┌──────────────────────────────────────────────────────────────────┐
-│              Central Agent Server (FastAPI)                       │
-│  ┌─────────────┐  ┌──────────────┐  ┌─────────────────────────┐ │
-│  │ Incident    │→ │ Claude Agent │→ │ Safe Executor           │ │
-│  │ Queue       │  │ (grounded)   │  │ SSH · kubectl · docker  │ │
-│  └─────────────┘  └──────────────┘  └─────────────────────────┘ │
-└──────┬──────────────────┬───────────────────────┬────────────────┘
-       │                  │                       │
-       ▼                  ▼                       ▼
-┌─────────────┐   ┌──────────────┐      ┌───────────────────────┐
-│ Cloud       │   │ Org docs +   │      │ Notifications         │
-│ Storage     │   │ audit logs   │      │ Slack · Email · Jira  │
-│ S3/MinIO/   │   │ checkpoints  │      │ Zoho · Escalation     │
-│ GCS/Azure   │   │ (per org)    │      └───────────────────────┘
-└─────────────┘   └──────────────┘
-       │
-       ▼
- Remote targets: EC2 (SSH) · EKS/GKE/AKS (API) · AWS/GCP/Azure (API)
-
-┌──────────────────────────────────────────────────────────────────┐
-│  MCP Server (devops-agent mcp) — any AI agent can connect        │
-│  Cursor · Claude Desktop · SDK agents · custom bots              │
-│  Tools: kubectl, GitHub logs, ArgoCD, Helm, cloud, queue, audit  │
-└──────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    accTitle: Webhook and MCP entry points
+    accDescr: Webhooks enter the incident queue while MCP clients can invoke tools or queue work; processing records organization-scoped outcomes.
+    alerts["Alerts and manual incidents"] --> api["FastAPI webhook server"]
+    api --> queue["Organization-scoped incident queue"]
+    queue --> worker["Background worker and agent"]
+    worker --> tools["Tool dispatch and execution controls"]
+    mcp["MCP client"] --> server["MCP server"]
+    server --> tools
+    server --> queue
+    tools <-->|Diagnostics and permitted operations| targets["Remote hosts, Kubernetes and cloud APIs"]
+    worker --> storage["Configured storage<br/>Audit, logs and checkpoints"]
+    worker --> notifications["Notifications and escalation"]
 ```
 
 **Processing model:** Webhooks return `status: queued` immediately. A background worker processes incidents, saves checkpoints (resume after crash), and writes audit/logs to org-scoped cloud storage.

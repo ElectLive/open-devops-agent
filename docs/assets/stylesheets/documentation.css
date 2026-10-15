@@ -73,6 +73,37 @@ body { background: #fff; }
   box-shadow: none;
 }
 .md-typeset table:not([class]) th { background: #f5f8fa; }
+.md-typeset .docs-diagram {
+  max-width: 100%;
+  overflow-x: auto;
+  margin: 1.3rem 0;
+  border: 1px solid #dce5eb;
+  border-radius: .45rem;
+  background: #f8fafb;
+}
+.md-typeset .mermaid {
+  --md-mermaid-font-family: var(--md-text-font);
+  --md-mermaid-node-bg-color: #edf6f4;
+  --md-mermaid-node-fg-color: #48766f;
+  --md-mermaid-label-bg-color: #f8fafb;
+  --md-mermaid-label-fg-color: #243744;
+  --md-mermaid-edge-color: #526574;
+  --md-mermaid-sequence-actor-bg-color: #edf6f4;
+  --md-mermaid-sequence-actor-border-color: #48766f;
+  --md-mermaid-sequence-actor-fg-color: #243744;
+  --md-mermaid-sequence-actor-line-color: #91a4ae;
+  --md-mermaid-sequence-message-fg-color: #243744;
+  --md-mermaid-sequence-message-line-color: #526574;
+  --md-mermaid-sequence-note-bg-color: #f2f6fa;
+  --md-mermaid-sequence-note-border-color: #91a4ae;
+  --md-mermaid-sequence-note-fg-color: #243744;
+  display: block;
+  min-width: 50rem;
+  padding: 1rem;
+  margin: 0;
+  background: #f8fafb;
+}
+.md-typeset .docs-diagram--sequence .mermaid { min-width: 70rem; }
 .md-typeset .docs-path {
   border-left: 3px solid #08756f;
   background: #f2f8f7;

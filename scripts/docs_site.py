@@ -2,6 +2,7 @@
 
 import posixpath
 import re
+from html import escape, unescape
 from pathlib import Path
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
@@ -79,3 +80,21 @@ def on_page_markdown(markdown: str, page: Page, config: MkDocsConfig, files: Fil
                     lines.append("\n")
             lines.append(line if fence else LINK.sub(rewrite, line))
     return "".join(lines)
+
+
+def on_page_content(html: str, page: Page, config: MkDocsConfig, files: Files) -> str:
+    """Keep Mermaid labels readable inside keyboard-accessible scroll regions."""
+    def wrap(match: re.Match[str]) -> str:
+        source = unescape(match[0])
+        title = re.search(r"accTitle:\s*([^\n]+)", source)
+        label = title[1] if title else "Documentation diagram"
+        classes = "docs-diagram"
+        if "sequenceDiagram" in source:
+            classes += " docs-diagram--sequence"
+        return (
+            f'<div class="{classes}" role="region" tabindex="0" '
+            f'aria-label="{escape(label, quote=True)}. Scroll horizontally when needed.">'
+            f"{match[0]}</div>"
+        )
+
+    return re.sub(r'<pre class="mermaid">.*?</pre>', wrap, html, flags=re.DOTALL)

@@ -1,69 +1,33 @@
-# Architecture Documentation
+# Architecture
 
-This document provides a detailed overview of the DevOps AI Agent architecture.
+This guide describes the incident-processing components, their data flow, and the boundaries between the agent and connected platforms.
 
 ## System Overview
 
-The DevOps AI Agent is a microservices-based system that uses AI to automatically respond to infrastructure incidents.
+The service accepts incident webhooks, queues work by organization, and coordinates diagnosis and configured tool operations through a background worker.
 
 ## High-Level Architecture
 
+```mermaid
+flowchart TB
+    accTitle: Incident processing architecture
+    accDescr: Webhooks queue incidents for a background worker; the agent collects context, proposes actions, runs permitted tools and records outcomes.
+    alerts["CI/CD and monitoring<br/>Manual incidents"] -->|Webhooks| api["FastAPI server<br/>api/server.py"]
+    api -->|Enqueue by organization| queue["Incident queue"]
+    queue -->|Claim pending incident| worker["Background worker"]
+    worker --> agent["Agent orchestrator<br/>agent/core.py"]
+    agent --> classifier["Incident classifier"]
+    agent --> collectors["Platform collectors"]
+    collectors <-->|Logs and resource status| platforms["Platform APIs<br/>Kubernetes, CI/CD and cloud"]
+    agent <-->|Context and tool proposals| model["Model reasoning loop"]
+    agent --> tools["Tool dispatch<br/>Execution controls"]
+    tools -->|Permitted operations| platforms
+    agent --> verify["Result verification"]
+    worker --> records["Organization records<br/>Audit and checkpoints"]
+    worker --> notify["Notifications<br/>and escalation"]
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        External Systems                         │
-├─────────────┬──────────────┬──────────────┬────────────────────┤
-│ CI/CD       │ Kubernetes   │ Cloud        │ Monitoring         │
-│ • GitHub    │ • Clusters   │ • AWS        │ • Prometheus       │
-│ • GitLab    │ • ArgoCD     │ • GCP        │ • AlertManager     │
-│ • Jenkins   │              │ • Azure      │ • PagerDuty        │
-└──────┬──────┴──────┬───────┴──────┬───────┴────────┬───────────┘
-       │             │              │                │
-       │ Webhooks    │ API Calls    │ API Calls      │ Webhooks
-       │             │              │                │
-       ▼             ▼              ▼                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                         API Gateway                             │
-│                      (FastAPI Server)                           │
-│                                                                 │
-│  Routes:                                                        │
-│  • /webhook/github      • /webhook/gitlab                      │
-│  • /webhook/alertmanager • /webhook/manual                     │
-│  • /health              • /audit                               │
-└───────────────────────────┬─────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Agent Orchestrator                         │
-│                      (agent/core.py)                            │
-│                                                                 │
-│  1. Classify incident type                                     │
-│  2. Select appropriate collector                               │
-│  3. Gather context                                             │
-│  4. Invoke AI reasoning loop                                   │
-│  5. Execute approved actions                                   │
-│  6. Verify results                                             │
-└───┬─────────────────┬──────────────────┬──────────────────────┘
-    │                 │                  │
-    ▼                 ▼                  ▼
-┌──────────┐  ┌──────────────┐  ┌──────────────┐
-│Classifier│  │  Collectors  │  │    Tools     │
-│          │  │              │  │              │
-│Issue Type│  │• K8s         │  │• K8s Actions │
-│Detection │  │• GitHub      │  │• Git Ops     │
-│          │  │• GitLab      │  │• Cloud Ops   │
-│          │  │• ArgoCD      │  │• Notifications│
-│          │  │• AWS/GCP/Az  │  │• Executor    │
-└──────────┘  └──────────────┘  └──────────────┘
-                                        │
-                                        ▼
-                                ┌──────────────┐
-                                │ Safe Executor│
-                                │              │
-                                │• Dry-run     │
-                                │• Whitelist   │
-                                │• Approval    │
-                                └──────────────┘
-```
+
+The queue and worker are part of the API service. Platform calls originate from collectors and tools; the diagram does not imply separate deployed services for every component.
 
 ## Core Components
 
@@ -250,51 +214,33 @@ audit_log.append({
 
 ### Incident Response Flow
 
-```
-1. External Alert Received
-   ├─ GitHub: workflow_run failure
-   ├─ Alertmanager: pod crash alert
-   └─ Manual: curl to /webhook/manual
-
-2. API Gateway → Agent Orchestrator
-   ├─ Validate request
-   ├─ Extract incident data
-   └─ Trigger agent
-
-3. Classifier → Determine Issue Type
-   ├─ Parse incident data
-   ├─ Check keywords
-   └─ Return issue type
-
-4. Collector → Gather Context
-   ├─ Fetch relevant logs
-   ├─ Get resource status
-   ├─ Check recent changes
-   └─ Return context dict
-
-5. AI Loop → Analyze & Plan
-   ├─ Send context to Claude
-   ├─ Claude analyzes logs
-   ├─ Claude suggests tools
-   └─ Return tool calls
-
-6. Safe Executor → Execute Tools
-   ├─ Validate tool call
-   ├─ Check whitelist
-   ├─ Run in dry-run first
-   ├─ Request approval if needed
-   ├─ Execute tool
-   └─ Return result
-
-7. Verification → Check Success
-   ├─ Run status checks
-   ├─ Verify issue resolved
-   └─ Log outcome
-
-8. Notification → Alert Team
-   ├─ Send Slack notification
-   ├─ Update audit log
-   └─ Close incident
+```mermaid
+sequenceDiagram
+    accTitle: Queued incident response
+    accDescr: The API acknowledges an incident before the worker performs diagnosis, tool execution and outcome recording.
+    participant Source as Alert source
+    participant API as FastAPI
+    participant Queue as Incident queue
+    participant Worker as Background worker
+    participant Agent as Agent orchestrator
+    participant Platform as Platform APIs
+    participant Store as Audit and notifications
+    Source->>API: Send webhook payload
+    API->>Queue: Enqueue organization-scoped incident
+    API-->>Source: Return queued status and incident identifier
+    Worker->>Queue: Claim pending incident
+    Worker->>Agent: Run or resume incident processing
+    Agent->>Platform: Collect logs and resource context
+    Platform-->>Agent: Return diagnostic evidence
+    Note over Agent: Classify the incident and propose actions
+    opt Operation permitted by configured controls
+        Agent->>Platform: Dispatch tool operation
+        Platform-->>Agent: Return operation result
+        Agent->>Platform: Verify resulting state
+    end
+    Agent-->>Worker: Return diagnosis, actions and verification
+    Worker->>Store: Save audit and evaluate escalation
+    Worker->>Queue: Mark completed or failed
 ```
 
 ## Plugin Architecture
@@ -343,39 +289,31 @@ self.tools.append({
 
 ### Authentication & Authorization
 
+```mermaid
+flowchart TB
+    accTitle: Access boundaries
+    accDescr: Inbound requests use endpoint-specific controls; outbound operations rely on configured platform credentials and platform permissions.
+    source["External webhook sender"] --> endpoint["Request validation<br/>Configured webhook signatures"]
+    endpoint --> api["FastAPI incident endpoints"]
+    api --> agent["Agent processing"]
+    agent --> credentials["Configured credentials<br/>Organization or environment"]
+    credentials --> cloud["Cloud and CI/CD APIs<br/>Platform permissions apply"]
+    credentials --> kubernetes["Kubernetes API<br/>Service account or kubeconfig<br/>RBAC permissions"]
+    deployment["Deployment access controls<br/>Ingress, gateway and network policy"] -.-> api
 ```
-External System → API Gateway
-                  ├─ Webhook signature verification
-                  ├─ API token validation
-                  └─ IP whitelist check
 
-Agent → External APIs
-        ├─ Service account tokens
-        ├─ API keys from env vars
-        └─ IAM roles (cloud)
-
-Agent → Kubernetes
-        ├─ In-cluster: ServiceAccount
-        ├─ External: kubeconfig
-        └─ RBAC policies
-```
+Inbound controls vary by endpoint and configuration. This diagram does not claim that API-token validation or an IP allowlist is implemented for every route; review the [security guarantees](SECURITY_GUARANTEES.md) and deployment configuration.
 
 ### Secrets Management
 
-```
-Development:
-    .env file (gitignored)
-
-Production:
-    Kubernetes Secrets
-    ├─ kubectl create secret
-    ├─ Sealed Secrets
-    └─ External Secrets Operator
-
-Cloud:
-    ├─ AWS Secrets Manager
-    ├─ GCP Secret Manager
-    └─ Azure Key Vault
+```mermaid
+flowchart LR
+    accTitle: Credential provisioning options
+    accDescr: Development environment files and deployment-managed secrets supply runtime credentials; listed secret managers require deployment configuration.
+    local["Development<br/>Git-ignored environment file"] --> runtime["Runtime credentials"]
+    kubernetes["Kubernetes deployment<br/>Kubernetes Secrets"] --> runtime
+    managers["Deployment secret providers<br/>AWS, GCP or Azure"] -.->|Configure injection for the deployment| runtime
+    runtime --> clients["Platform API clients"]
 ```
 
 ## Scalability
