@@ -714,8 +714,8 @@ Detailed guides for each platform:
 
 - [Multi-Platform Guide](MULTI_PLATFORM_GUIDE.md) - Complete configuration reference
 - [GitHub Actions Setup](#github-actions)
-- [Kubernetes RBAC](#kubernetes-rbac)
-- [Cloud Provider Auth](#cloud-provider-authentication)
+- [Kubernetes deployment](docs/DEPLOYMENT.md)
+- [Cloud provider configuration](docs/MULTI_PLATFORM_GUIDE.md#cloud-providers)
 
 ### Webhook Configuration
 
@@ -925,6 +925,9 @@ pytest --cov=. tests/
 ---
 
 ## Documentation
+
+The GitHub Pages website is prepared by the documentation workflow. See the
+[website guide](docs/DOCUMENTATION_SITE.md) for local previews and maintainer setup.
 
 ### Start here
 

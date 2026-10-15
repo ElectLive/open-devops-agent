@@ -1,6 +1,6 @@
 # Documentation
 
-All project documentation is organized here.
+All project documentation is organized here. The [documentation website guide](DOCUMENTATION_SITE.md) explains local previews and GitHub Pages deployment.
 
 ## Essential Reading
 

@@ -90,3 +90,6 @@ docker-compose.override.yml
 dmypy.json
 .pyre/
 .review-worktrees/
+
+# Generated documentation website
+site/
