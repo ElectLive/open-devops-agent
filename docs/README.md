@@ -1,89 +1,110 @@
-# Documentation
+# Open DevOps Agent documentation
 
-All project documentation is organized here.
+Configure the agent, connect your platforms, and review how incidents move from
+an incoming alert to diagnosis, approval and a recorded outcome.
 
-## Essential Reading
+<div class="docs-path" markdown="1">
 
-**Start Here:**
-- [`../README.md`](../README.md) - Main project documentation
-- [`../usage-readme.md`](../usage-readme.md) - Installation and common DevOps fixes
-- [`../SECURITY_GUARANTEES.md`](../SECURITY_GUARANTEES.md) - Security and safety guarantees
+**New to the project?** Start with the [local setup guide](GETTING_STARTED.md),
+then check [platform support](PLATFORM_SUPPORT.md) and the
+[safety guarantees](../SECURITY_GUARANTEES.md) before connecting infrastructure.
 
-## Guides
+</div>
 
-**Deployment:**
-- [`ORGANIZATIONAL_GUIDE.md`](ORGANIZATIONAL_GUIDE.md) - How to deploy in your organization
-- [`DEPLOYMENT.md`](DEPLOYMENT.md) - Platform-specific deployment guides
-- [`GETTING_STARTED.md`](GETTING_STARTED.md) - Quick start guide
+## Find the right guide
 
-**Reference:**
-- [`API_REFERENCE.md`](API_REFERENCE.md) - **Full REST API reference (new endpoints)**
-- [`API_TESTING.md`](API_TESTING.md) - **Postman & curl testing guide**
-- [`ESCALATION.md`](ESCALATION.md) - **Auto-ticketing when agent cannot resolve**
-- [`COVERAGE_GAPS.md`](COVERAGE_GAPS.md) - **Helm, ArgoCD, Terraform, runbooks, suggest_fix, extensions**
-- [`E2E_EC2_DOCKER_TEST.md`](E2E_EC2_DOCKER_TEST.md) - **EC2 + Docker crash-loop E2E test**
-- [`../postman/`](../postman/) - Postman collection and environment
-- [`PLATFORM_SUPPORT.md`](PLATFORM_SUPPORT.md) - Complete platform support matrix
-- [`FEATURES_SUMMARY.md`](FEATURES_SUMMARY.md) - Feature quick reference
-- [`QUESTIONS_ANSWERED.md`](QUESTIONS_ANSWERED.md) - FAQ and detailed answers
+<div class="docs-grid" markdown="1">
 
-**Security:**
-- [`SECURITY_POLICY.md`](SECURITY_POLICY.md) - Security policies and procedures
-- [`SECURITY_SUMMARY.md`](SECURITY_SUMMARY.md) - Security features summary
-- [`DEVSECOPS_GUIDE.md`](DEVSECOPS_GUIDE.md) - DevSecOps features and best practices
+<div class="docs-card" markdown="1">
 
-**Technical:**
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) - System architecture and design
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) - How to contribute
-- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) - Community guidelines
+### Install and configure
 
-**Status:**
-- [`START_HERE.md`](START_HERE.md) - Quick overview
-- [`FINAL_COMPREHENSIVE_STATUS.md`](FINAL_COMPREHENSIVE_STATUS.md) - Complete project status
-- [`PROJECT_STATUS.md`](PROJECT_STATUS.md) - Project checklist
-- [`EXTENSION_SUMMARY.md`](EXTENSION_SUMMARY.md) - Platform extensions summary
+Set up a local environment, configure credentials and confirm that the API is running.
 
-## Documentation Index
+[Start the local setup](GETTING_STARTED.md){ .docs-card-link }
 
-### By Topic
+[Package and Docker builds](BUILD_AND_USAGE.md) · [Usage reference](../usage-readme.md)
 
-**Getting Started:**
-1. Read [`../README.md`](../README.md)
-2. Review [`../SECURITY_GUARANTEES.md`](../SECURITY_GUARANTEES.md)
-3. Check [`../usage-readme.md`](../usage-readme.md) for automated fixes
-4. Follow [`DEPLOYMENT.md`](DEPLOYMENT.md) for your platform
+</div>
 
-**For DevOps Teams:**
-- [`../usage-readme.md`](../usage-readme.md) - What tasks are automated
-- [`ORGANIZATIONAL_GUIDE.md`](ORGANIZATIONAL_GUIDE.md) - How to deploy
-- [`PLATFORM_SUPPORT.md`](PLATFORM_SUPPORT.md) - What platforms are supported
+<div class="docs-card" markdown="1">
 
-**For SRE Teams:**
-- [`../SECURITY_GUARANTEES.md`](../SECURITY_GUARANTEES.md) - Security assurance
-- [`SECURITY_POLICY.md`](SECURITY_POLICY.md) - Safety policies
-- [`DEVSECOPS_GUIDE.md`](DEVSECOPS_GUIDE.md) - Security features
+### Deploy the service
 
-**For Security Teams:**
-- [`../SECURITY_GUARANTEES.md`](../SECURITY_GUARANTEES.md) - Complete security details
-- [`SECURITY_POLICY.md`](SECURITY_POLICY.md) - Security controls
-- [`DEVSECOPS_GUIDE.md`](DEVSECOPS_GUIDE.md) - Compliance features
+Choose a deployment model and configure the service for your environment.
 
-**For Developers:**
-- [`ARCHITECTURE.md`](ARCHITECTURE.md) - System design
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) - How to contribute
-- [`FEATURES_SUMMARY.md`](FEATURES_SUMMARY.md) - API and features
+[Read the deployment guide](DEPLOYMENT.md){ .docs-card-link }
 
-## Quick Links
+[Centralized deployment](CENTRALIZED_DEPLOYMENT.md) · [Organization rollout](ORGANIZATIONAL_GUIDE.md)
 
-- **Main README**: [`../README.md`](../README.md)
-- **Usage Guide**: [`../usage-readme.md`](../usage-readme.md)
-- **Security**: [`../SECURITY_GUARANTEES.md`](../SECURITY_GUARANTEES.md)
-- **Deployment**: [`DEPLOYMENT.md`](DEPLOYMENT.md)
-- **Build (Python package + Docker)**: [`BUILD_AND_USAGE.md`](BUILD_AND_USAGE.md)
-- **API Reference**: [`API_REFERENCE.md`](API_REFERENCE.md)
-- **API Testing (Postman)**: [`API_TESTING.md`](API_TESTING.md)
-- **Organization Guide**: [`ORGANIZATIONAL_GUIDE.md`](ORGANIZATIONAL_GUIDE.md)
+</div>
 
----
+<div class="docs-card" markdown="1">
 
-All documentation is kept up to date with each release.
+### Connect platforms
+
+Check the support matrix and find the configuration for your CI/CD or cloud platform.
+
+[Check platform support](PLATFORM_SUPPORT.md){ .docs-card-link }
+
+[Platform configuration](MULTI_PLATFORM_GUIDE.md) · [Deployment examples](USE_CASES_GCP_GITLAB_AND_AWS_BAMBOO.md)
+
+</div>
+
+<div class="docs-card" markdown="1">
+
+### Use and test the API
+
+Look up endpoints, webhook signatures, organization scoping and request examples.
+
+[Open the API reference](API_REFERENCE.md){ .docs-card-link }
+
+[Postman and curl tests](API_TESTING.md) · [EC2 and Docker checks](E2E_EC2_DOCKER_TEST.md)
+
+</div>
+
+<div class="docs-card" markdown="1">
+
+### Review safety controls
+
+Understand operation restrictions, approval requirements and the documented limits of the system.
+
+[Review safety guarantees](../SECURITY_GUARANTEES.md){ .docs-card-link }
+
+[Security policy](SECURITY_POLICY.md) · [Coverage gaps](COVERAGE_GAPS.md)
+
+</div>
+
+<div class="docs-card" markdown="1">
+
+### Investigate and extend
+
+Follow escalation setup, inspect the architecture or prepare a contribution.
+
+[Configure escalation](ESCALATION.md){ .docs-card-link }
+
+[Architecture](../ARCHITECTURE.md) · [Contributing](../CONTRIBUTING.md)
+
+</div>
+
+</div>
+
+## Before running against infrastructure
+
+Start with `AUTO_APPLY=false`, use credentials scoped to the systems you intend
+to connect, and review the safety documentation. Platform support and available
+operations vary; use the [support matrix](PLATFORM_SUPPORT.md) and
+[coverage gaps](COVERAGE_GAPS.md) to check the behaviour you need.
+
+## How these guides are organized
+
+Use the topic navigation for setup, deployment, API and security documentation.
+Long pages have an on-page contents list, and search covers the complete guide
+collection. Code blocks provide a copy control for commands and configuration.
+
+The **Project notes** section preserves earlier status reports and design
+summaries. Read those as project history alongside the current support matrix
+and source code, rather than as release guarantees.
+
+To update or publish the website, follow the
+[documentation maintenance guide](DOCUMENTATION_SITE.md).

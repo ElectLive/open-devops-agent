@@ -1,5 +1,9 @@
 # START HERE - Quick Overview
 
+> **Project note:** This page records an earlier implementation summary. Check the
+> [platform support matrix](PLATFORM_SUPPORT.md) and current source before relying
+> on a feature or deployment claim.
+
 ## All Your Requirements Have Been Implemented
 
 This document answers your questions and shows you where to find everything.
@@ -363,7 +367,7 @@ All your requirements have been implemented:
 - 30+ passing tests
 - Complete CI/CD pipeline
 
-**The agent is now production-ready for your organization.**
+Review the current support matrix and deployment requirements before using the agent in your environment.
 
 ---
 
@@ -377,7 +381,7 @@ All your requirements have been implemented:
 
 ---
 
-**Welcome to the DevOps AI Agent!**
+Review the current support matrix and deployment requirements before using the agent in your environment.
 
 All your questions have been answered and all features have been implemented.
 

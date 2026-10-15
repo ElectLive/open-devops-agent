@@ -1,6 +1,6 @@
-# Getting Started with DevOps AI Agent
+# Getting started
 
-Welcome! This guide will help you get the DevOps AI Agent up and running in 15 minutes.
+Set up the agent locally, configure the integrations you need, and verify the API before sending an incident.
 
 ## Overview
 
@@ -15,13 +15,13 @@ The DevOps AI Agent is an autonomous system that:
 ### 1. Prerequisites
 
 Ensure you have:
-- Python 3.9 or higher
+- Python 3.10 or higher
 - `pip` and `venv`
 - Git
 
 ```bash
 # Check Python version
-python --version  # Should be 3.9+
+python --version  # Should be 3.10+
 
 # Check pip
 pip --version
@@ -32,7 +32,7 @@ pip --version
 ```bash
 # Clone the repository
 git clone https://github.com/open-devops-agent/open-devops-agent.git
-cd devops-ai-agent
+cd open-devops-agent
 
 # Create virtual environment
 python -m venv venv
@@ -188,7 +188,7 @@ Quick summary:
 4. Trigger: `POST /webhook/manual` with `type: server`
 5. Poll `GET /audit?org_id=acme-corp`
 
-Congratulations! Your agent is running locally. 
+After the health check succeeds, continue with the platform-specific setup below.
 
 ---
 
@@ -571,6 +571,4 @@ Now that your agent is running:
 3. Check out [CONTRIBUTING.md](CONTRIBUTING.md) to add custom platforms
 4. Join our community to share experiences
 
-**Happy automating!** 
-
-Let the agent handle the toil while you focus on building great products.
+Use the audit log to review outcomes and record any configuration changes needed for your environment.

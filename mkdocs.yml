@@ -1,0 +1,80 @@
+site_name: Open DevOps Agent documentation
+site_url: https://open-devops-agent.github.io/open-devops-agent/
+repo_url: https://github.com/open-devops-agent/open-devops-agent
+edit_uri: ''
+site_description: Installation, deployment, API and security guides for Open DevOps Agent.
+theme:
+  name: material
+  font: false
+  palette:
+    scheme: default
+    primary: custom
+    accent: custom
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+extra:
+  generator: false
+extra_css:
+  - assets/stylesheets/documentation.css
+validation:
+  links:
+    anchors: warn
+plugins:
+  - search
+hooks:
+  - scripts/docs_site.py
+markdown_extensions:
+  - tables
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - toc:
+      permalink: true
+nav:
+  - Home: README.md
+  - Getting started:
+      - Quick start: GETTING_STARTED.md
+      - Project overview: project/README.md
+      - Installation and usage: project/usage-readme.md
+      - Build and packaging: BUILD_AND_USAGE.md
+  - Deployment:
+      - Deployment guide: DEPLOYMENT.md
+      - Centralized deployment: CENTRALIZED_DEPLOYMENT.md
+      - Organization rollout: ORGANIZATIONAL_GUIDE.md
+      - Platform support: PLATFORM_SUPPORT.md
+      - Platform configuration: MULTI_PLATFORM_GUIDE.md
+      - EC2 and Docker testing: E2E_EC2_DOCKER_TEST.md
+      - Escalation: ESCALATION.md
+  - API and development:
+      - API reference: API_REFERENCE.md
+      - API testing: API_TESTING.md
+      - Architecture: project/ARCHITECTURE.md
+      - Contributing: project/CONTRIBUTING.md
+      - Documentation website: DOCUMENTATION_SITE.md
+  - Security:
+      - Safety guarantees: project/SECURITY_GUARANTEES.md
+      - Security policy: SECURITY_POLICY.md
+      - DevSecOps guide: DEVSECOPS_GUIDE.md
+      - Security summary: SECURITY_SUMMARY.md
+  - Project reference:
+      - Features: FEATURES_SUMMARY.md
+      - Coverage gaps: COVERAGE_GAPS.md
+      - Questions and answers: QUESTIONS_ANSWERED.md
+      - Extensions: EXTENSION_SUMMARY.md
+  - Project notes:
+      - Earlier overview: START_HERE.md
+      - Project status: PROJECT_STATUS.md
+      - Status summary: FINAL_STATUS.md
+      - Comprehensive status: FINAL_COMPREHENSIVE_STATUS.md
+      - Community guidelines: project/CODE_OF_CONDUCT.md
+      - Change summary: project/SUMMARY_OF_CHANGES.md
+      - Deployment examples: USE_CASES_GCP_GITLAB_AND_AWS_BAMBOO.md
