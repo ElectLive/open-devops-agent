@@ -233,3 +233,82 @@ class TestCicdCloudArgocdVerification:
         )
         result = await verifier._verify_argocd_fix({"app_name": "frontend"})
         assert result["passed"] is False
+
+
+class TestFailClosedVerification:
+    """
+    Regression coverage for issue #69: verification must not report success
+    without observing the target system.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "expected_state",
+        [{}, {"pod_status": "Running"}, {"pod_name": "api"}, {"namespace": "prod"}],
+    )
+    async def test_k8s_without_pod_identifiers_does_not_pass(self, expected_state):
+        verifier = FixVerifier()
+        with patch("subprocess.run") as mock_run:
+            result = await verifier._verify_k8s_fix(expected_state)
+        assert result["passed"] is False
+        assert "pod_name" in result["message"]
+        assert "namespace" in result["message"]
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expected_state", [{}, {"unrelated": "value"}])
+    async def test_server_without_service_name_does_not_pass(self, expected_state):
+        verifier = FixVerifier()
+        with patch("subprocess.run") as mock_run:
+            result = await verifier._verify_server_fix(expected_state)
+        assert result["passed"] is False
+        assert "service_name" in result["message"]
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("incident_type", ["helm", "terraform", "unknown_type"])
+    async def test_unimplemented_incident_type_does_not_pass(self, incident_type):
+        verifier = FixVerifier()
+        with patch("subprocess.run"):
+            result = await verifier._run_immediate_checks(incident_type, {})
+        assert result["passed"] is False
+        assert "not implemented" in result["message"]
+        assert incident_type in result["message"]
+
+    @pytest.mark.asyncio
+    async def test_verify_fix_unimplemented_type_does_not_pass(self):
+        verifier = FixVerifier()
+        # Guard against a real 300s monitoring loop if the immediate check passes.
+        verifier._monitor_stability = AsyncMock(return_value={"stable": True})
+        with patch("subprocess.run"):
+            result = await verifier.verify_fix(
+                "helm", "helm rollback", {}, monitoring_duration=300
+            )
+        assert result["verified"] is False
+        assert result["status"] == "failed"
+        assert len(result["checks_performed"]) == 1
+        verifier._monitor_stability.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_k8s_with_pod_identifiers_observes_pod(self):
+        verifier = FixVerifier()
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(stdout="Running\n")
+            result = await verifier._verify_k8s_fix(
+                {"pod_name": "api", "namespace": "prod", "pod_status": "Running"}
+            )
+        assert result["passed"] is True
+        mock_run.assert_called_once()
+        assert mock_run.call_args[0][0][:4] == ["kubectl", "get", "pod", "api"]
+
+    @pytest.mark.asyncio
+    async def test_server_with_service_name_observes_service(self):
+        verifier = FixVerifier()
+        with patch("platform.system", return_value="Linux"), patch(
+            "subprocess.run"
+        ) as mock_run:
+            mock_run.return_value = MagicMock(stdout="active\n")
+            result = await verifier._verify_server_fix({"service_name": "nginx"})
+        assert result["passed"] is True
+        mock_run.assert_called_once()
+        assert mock_run.call_args[0][0] == ["systemctl", "is-active", "nginx"]
