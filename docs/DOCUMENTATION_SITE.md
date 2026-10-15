@@ -63,3 +63,14 @@ contents list, search and code-copy controls. The home page becomes a single
 column on narrow screens. Keep colours and spacing in
 `assets/stylesheets/documentation.css`, preserve visible keyboard focus, and
 respect reduced-motion preferences when changing the design.
+
+## Motion and interaction
+
+Instant navigation keeps the documentation shell available between guide pages.
+A short content entrance, clear hover and focus states, smooth anchor scrolling,
+and a reading-progress line provide feedback while browsing. The progress line
+tracks the current page and resets when navigation changes the content.
+
+Reduced-motion preferences disable entrance animations, animated transitions, and
+smooth scrolling. Content remains visible when JavaScript is unavailable, and
+all guide links use standard URLs that work with normal page navigation.
