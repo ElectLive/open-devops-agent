@@ -1,5 +1,9 @@
 # Final Project Status - DevOps AI Agent
 
+> **Project note:** This page records an earlier implementation summary. Check the
+> [platform support matrix](PLATFORM_SUPPORT.md) and current source before relying
+> on a feature or deployment claim.
+
 ## ✅ Completion Status: READY FOR PRODUCTION
 
 Date: June 12, 2026

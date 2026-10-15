@@ -1,12 +1,16 @@
 # Project Status: DevOps AI Agent
 
+> **Project note:** This page records an earlier implementation summary. Check the
+> [platform support matrix](PLATFORM_SUPPORT.md) and current source before relying
+> on a feature or deployment claim.
+
 **Status**: ✅ Ready for GitHub Publication
 
 **Date**: June 12, 2026
 
 ## Summary
 
-The DevOps AI Agent is now a **complete, production-ready, open-source project** suitable for contribution on GitHub.
+This page summarizes the project structure, available guides and development tasks at the time of writing.
 
 ## What's Included
 
@@ -255,4 +259,4 @@ Open for contributions! See CONTRIBUTING.md
 
 ---
 
-**Project is 100% complete and ready for publication! 🚀**
+Review the current support matrix and deployment requirements before using the agent in your environment.

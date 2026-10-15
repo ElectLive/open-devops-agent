@@ -2,10 +2,10 @@ name: Documentation
 
 on:
   pull_request:
-    paths: ['docs/**', '*.md', 'mkdocs.yml', 'requirements-docs.txt', 'scripts/docs_site.py', '.github/workflows/docs.yml']
+    paths: ['docs/**', '*.md', 'mkdocs.yml', 'requirements-docs.txt', 'scripts/docs_site.py', 'scripts/check_docs_links.py', '.github/workflows/docs.yml']
   push:
     branches: [main]
-    paths: ['docs/**', '*.md', 'mkdocs.yml', 'requirements-docs.txt', 'scripts/docs_site.py', '.github/workflows/docs.yml']
+    paths: ['docs/**', '*.md', 'mkdocs.yml', 'requirements-docs.txt', 'scripts/docs_site.py', 'scripts/check_docs_links.py', '.github/workflows/docs.yml']
   workflow_dispatch:
 
 permissions:
@@ -23,6 +23,7 @@ jobs:
           cache-dependency-path: requirements-docs.txt
       - run: pip install -r requirements-docs.txt
       - run: mkdocs build --strict
+      - run: python scripts/check_docs_links.py
       - uses: actions/upload-pages-artifact@v3
         if: github.event_name != 'pull_request'
         with:

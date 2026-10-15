@@ -1,5 +1,9 @@
 # Final Comprehensive Status
 
+> **Project note:** This page records an earlier implementation summary. Check the
+> [platform support matrix](PLATFORM_SUPPORT.md) and current source before relying
+> on a feature or deployment claim.
+
 ## Mission Accomplished
 
 All requested features have been implemented, tested, and documented.
@@ -658,7 +662,7 @@ See `CONTRIBUTING.md` for:
 
 ---
 
-**The DevOps AI Agent is now production-ready for deployment in your organization.**
+Review the current support matrix and deployment requirements before using the agent in your environment.
 
 **All requested features have been implemented, tested, and documented.**
 

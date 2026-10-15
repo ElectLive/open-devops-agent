@@ -73,5 +73,9 @@ def on_page_markdown(markdown: str, page: Page, config: MkDocsConfig, files: Fil
             fence = None if fence == marker else marker if fence is None else fence
             lines.append(line)
         else:
+            if not fence and re.match(r"^(?:[-*+] |\d+[.)] )", line):
+                previous = lines[-1].strip() if lines else ""
+                if previous and not re.match(r"^(?:[-*+] |\d+[.)] )", previous):
+                    lines.append("\n")
             lines.append(line if fence else LINK.sub(rewrite, line))
     return "".join(lines)

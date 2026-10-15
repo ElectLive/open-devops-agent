@@ -1,5 +1,9 @@
 # Multi-Platform Extension - Summary of Changes
 
+> **Project note:** This page records an earlier implementation summary. Check the
+> [platform support matrix](PLATFORM_SUPPORT.md) and current source before relying
+> on a feature or deployment claim.
+
 This document summarizes all the changes made to extend the DevOps AI Agent to support multiple CI/CD platforms, cloud providers, and ArgoCD.
 
 ## 📊 Summary Statistics
@@ -367,4 +371,4 @@ The DevOps AI Agent now supports:
 - ✅ **Comprehensive docs** and examples
 - ✅ **Backward compatible** with existing functionality
 
-The agent is production-ready with proper safety controls and can handle incidents across your entire DevOps stack! 🚀
+Review the current support matrix and deployment requirements before using the agent in your environment.

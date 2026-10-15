@@ -4,9 +4,25 @@ repo_url: https://github.com/open-devops-agent/open-devops-agent
 edit_uri: ''
 site_description: Installation, deployment, API and security guides for Open DevOps Agent.
 theme:
-  name: mkdocs
-  navigation_depth: 3
-  highlightjs: true
+  name: material
+  font: false
+  palette:
+    scheme: default
+    primary: custom
+    accent: custom
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.top
+    - navigation.footer
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - toc.follow
+extra:
+  generator: false
+extra_css:
+  - assets/stylesheets/documentation.css
 validation:
   links:
     anchors: warn
@@ -16,7 +32,11 @@ hooks:
   - scripts/docs_site.py
 markdown_extensions:
   - tables
-  - fenced_code
+  - attr_list
+  - md_in_html
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
   - toc:
       permalink: true
 nav:
@@ -50,7 +70,8 @@ nav:
       - Coverage gaps: COVERAGE_GAPS.md
       - Questions and answers: QUESTIONS_ANSWERED.md
       - Extensions: EXTENSION_SUMMARY.md
-      - Overview: START_HERE.md
+  - Project notes:
+      - Earlier overview: START_HERE.md
       - Project status: PROJECT_STATUS.md
       - Status summary: FINAL_STATUS.md
       - Comprehensive status: FINAL_COMPREHENSIVE_STATUS.md

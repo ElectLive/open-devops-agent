@@ -1,6 +1,6 @@
 # Documentation website
 
-The documentation website uses MkDocs and the existing Markdown guides as its
+The documentation website uses MkDocs with the Material theme and the existing Markdown guides as its
 source. Root-level guides are included during the build without maintaining
 duplicate copies. Search and topic navigation are generated automatically.
 
@@ -21,6 +21,7 @@ Open the local address printed by MkDocs to review your changes.
 
 ```bash
 mkdocs build --strict
+python scripts/check_docs_links.py
 ```
 
 The strict build writes the generated website to `site/`, which is excluded from
@@ -48,3 +49,17 @@ Edit the existing Markdown source files and update `mkdocs.yml` when adding a ne
 navigation entry. Keep local Markdown links relative so they remain useful when
 browsing GitHub. The build hook maps links to published guides and sends links to
 repository files back to GitHub. Run the strict build before submitting a change.
+
+## Content and design conventions
+
+Write task-focused instructions with concrete prerequisites, commands and expected
+results. Keep configuration examples and API details available from the topic
+navigation. Avoid time-to-completion promises, promotional slogans and claims of
+production readiness that are not supported by current evidence. Mark historical
+status summaries as project notes rather than current feature guarantees.
+
+The theme uses local system fonts, topic tabs, section navigation, an on-page
+contents list, search and code-copy controls. The home page becomes a single
+column on narrow screens. Keep colours and spacing in
+`assets/stylesheets/documentation.css`, preserve visible keyboard focus, and
+respect reduced-motion preferences when changing the design.

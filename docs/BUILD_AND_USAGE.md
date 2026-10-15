@@ -25,11 +25,11 @@ How to build, install, and run the DevOps AI Agent as a **Python package** or **
 
 ### Build the Python package
 
-**Requirements:** Python 3.9+, `pip`, `build`
+**Requirements:** Python 3.10+, `pip`, `build`
 
 ```bash
 git clone https://github.com/open-devops-agent/open-devops-agent.git
-cd devops-ai-agent
+cd open-devops-agent
 
 # Option A: use the build script
 chmod +x scripts/build_package.sh
@@ -185,7 +185,7 @@ pip install devops-ai-agent
 
 ```bash
 git clone https://github.com/open-devops-agent/open-devops-agent.git
-cd devops-ai-agent
+cd open-devops-agent
 
 # Option A: use the build script
 chmod +x scripts/build_docker.sh
