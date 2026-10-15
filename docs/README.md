@@ -1,17 +1,55 @@
-# Open DevOps Agent documentation
+---
+title: Documentation
+hide:
+  - navigation
+  - toc
+---
 
-Configure the agent, connect your platforms, and review how incidents move from
-an incoming alert to diagnosis, approval and a recorded outcome.
+<div class="docs-hero" markdown="1">
 
-<div class="docs-path" markdown="1">
+<div class="docs-hero-copy" markdown="1">
 
-**New to the project?** Start with the [local setup guide](GETTING_STARTED.md),
-then check [platform support](PLATFORM_SUPPORT.md) and the
-[safety guarantees](../SECURITY_GUARANTEES.md) before connecting infrastructure.
+<p class="docs-eyebrow">Open DevOps Agent / Documentation</p>
+
+# Set up, connect, and troubleshoot.
+
+Install the agent, configure your integrations, and follow the guides for
+reviewing incidents, controlling changes, and checking the results in your environment.
+
+<div class="docs-actions" markdown="1">
+
+[Start local setup](GETTING_STARTED.md){ .docs-button .docs-button-primary }
+[Browse API reference](API_REFERENCE.md){ .docs-button .docs-button-secondary }
 
 </div>
 
-## Find the right guide
+<p class="docs-hero-note">Python 3.10 or later · Local, Docker, and cloud deployment guides</p>
+
+</div>
+
+<div class="docs-hero-panel" markdown="1">
+
+<p class="docs-panel-label">A practical starting point</p>
+
+### Start with a local environment
+
+From the cloned repository, create a local environment before connecting the agent to infrastructure.
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+Keep `AUTO_APPLY=false` while reviewing proposed actions.
+
+[Read the configuration steps](GETTING_STARTED.md#3-configure-api-keys)
+
+</div>
+
+</div>
+
+## Choose your next task
 
 <div class="docs-grid" markdown="1">
 
@@ -103,8 +141,7 @@ Long pages have an on-page contents list, and search covers the complete guide
 collection. Code blocks provide a copy control for commands and configuration.
 
 The **Project notes** section preserves earlier status reports and design
-summaries. Read those as project history alongside the current support matrix
-and source code, rather than as release guarantees.
+summaries. Use the current support matrix and source code to verify the claims in those notes.
 
 To update or publish the website, follow the
 [documentation maintenance guide](DOCUMENTATION_SITE.md).

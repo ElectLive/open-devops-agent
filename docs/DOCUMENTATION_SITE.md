@@ -63,3 +63,32 @@ contents list, search and code-copy controls. The home page becomes a single
 column on narrow screens. Keep colours and spacing in
 `assets/stylesheets/documentation.css`, preserve visible keyboard focus, and
 respect reduced-motion preferences when changing the design.
+
+## Motion and interaction
+
+Instant navigation keeps the documentation shell available between guide pages.
+A short content entrance, clear hover and focus states, smooth anchor scrolling,
+and a reading-progress line provide feedback while browsing. The progress line
+tracks the current page and resets when navigation changes the content.
+
+Reduced-motion preferences disable entrance animations, animated transitions, and
+smooth scrolling. Content remains visible when JavaScript is unavailable, and
+all guide links use standard URLs that work with normal page navigation.
+
+## Architecture diagrams
+
+Architecture diagrams use fenced `mermaid` blocks in the existing Markdown
+sources. Material renders those blocks in the browser and adapts their colours
+to the documentation theme. This includes the project overview, incident
+processing, request sequence, access boundaries and credential provisioning.
+
+Give each diagram an `accTitle` and `accDescr` so its purpose and relationships
+are described in the source. Wide diagrams appear in labelled, focusable scroll
+regions; use the arrow keys or horizontal scrolling to inspect their labels on
+narrow screens. Keep explanatory text beside each diagram so the main workflow
+remains understandable without the rendered graphic.
+
+The theme loads Mermaid from its public CDN when a diagram page opens. A local
+Markdown preview without Mermaid support displays the editable diagram source.
+The strict documentation build validates Markdown links, while browser review
+is required to confirm Mermaid rendering after a diagram changes.

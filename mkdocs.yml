@@ -11,6 +11,8 @@ theme:
     primary: custom
     accent: custom
   features:
+    - navigation.instant
+    - navigation.instant.progress
     - navigation.tabs
     - navigation.tabs.sticky
     - navigation.top
@@ -23,6 +25,8 @@ extra:
   generator: false
 extra_css:
   - assets/stylesheets/documentation.css
+extra_javascript:
+  - assets/javascripts/documentation.js
 validation:
   links:
     anchors: warn
@@ -36,7 +40,11 @@ markdown_extensions:
   - md_in_html
   - pymdownx.highlight:
       anchor_linenums: true
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - toc:
       permalink: true
 nav:
