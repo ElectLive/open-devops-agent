@@ -22,21 +22,19 @@ class EmailNotifier:
     """
     
     def __init__(self):
+        self.refresh_credentials()
+        if not self.enabled:
+            logger.warning("Email notifications are DISABLED. Set EMAIL_ENABLED=true to enable.")
+
+    def refresh_credentials(self) -> None:
         self.enabled = os.getenv('EMAIL_ENABLED', 'false').lower() == 'true'
         self.smtp_host = os.getenv('EMAIL_SMTP_HOST', 'smtp.gmail.com')
         self.smtp_port = int(os.getenv('EMAIL_SMTP_PORT', '587'))
         self.smtp_user = os.getenv('EMAIL_SMTP_USER', '')
         self.smtp_password = os.getenv('EMAIL_SMTP_PASSWORD', '')
         self.from_email = os.getenv('EMAIL_FROM', self.smtp_user)
-        self.to_emails = os.getenv('EMAIL_TO', '').split(',')
-        self.cc_emails = os.getenv('EMAIL_CC', '').split(',')
-        
-        # Filter out empty strings
-        self.to_emails = [e.strip() for e in self.to_emails if e.strip()]
-        self.cc_emails = [e.strip() for e in self.cc_emails if e.strip()]
-        
-        if not self.enabled:
-            logger.warning("Email notifications are DISABLED. Set EMAIL_ENABLED=true to enable.")
+        self.to_emails = [e.strip() for e in os.getenv('EMAIL_TO', '').split(',') if e.strip()]
+        self.cc_emails = [e.strip() for e in os.getenv('EMAIL_CC', '').split(',') if e.strip()]
     
     def send_dangerous_operation_alert(
         self,

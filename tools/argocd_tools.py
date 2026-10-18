@@ -17,6 +17,9 @@ class ArgoCDTools:
     def __init__(self):
         self.collector = ArgoCDCollector()
 
+    def refresh_credentials(self) -> None:
+        self.collector.refresh_credentials()
+
     async def sync_application(
         self,
         app_name: str,

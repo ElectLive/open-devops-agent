@@ -13,6 +13,9 @@ log = structlog.get_logger()
 
 class AzureDevOpsCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.org = os.getenv("AZURE_DEVOPS_ORG", "")
         self.pat = os.getenv("AZURE_DEVOPS_PAT", "")
         self.headers = {

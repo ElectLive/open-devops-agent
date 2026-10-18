@@ -13,6 +13,7 @@ from agent.core import AGENT_TOOLS, DevOpsAgent
 from services.incident_queue import IncidentQueue
 from services.incident_store import IncidentStore
 from services.org_config import OrgConfig
+from services.org_context import org_credentials, refresh_agent_credentials
 from services.org_docs import OrgDocs
 
 load_dotenv()
@@ -155,7 +156,9 @@ def register_platform_tools(
         payload.setdefault("source", "mcp")
         payload["org_id"] = org
         iid = incident_id or f"mcp-{org}"
-        result = await agent.run(payload, incident_id=iid, resume=False)
+        with org_credentials(org):
+            refresh_agent_credentials(agent)
+            result = await agent.run(payload, incident_id=iid, resume=False)
         return result
 
     @mcp.tool(name="get_incident_audit", description="Fetch recent incident audit entries for an organization.")

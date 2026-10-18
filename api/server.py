@@ -70,6 +70,7 @@ async def process_incident(entry: dict):
 
     with org_credentials(org_id):
         refresh_agent_credentials(agent)
+        escalation_service.refresh_credentials()
         await _process_incident_with_org_creds(entry, incident_id, org_id, context, started_at)
 
 

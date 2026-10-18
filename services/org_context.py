@@ -41,11 +41,41 @@ def org_credentials(org_id: str, org_config: Optional[OrgConfig] = None) -> Gene
                 os.environ[key] = old
 
 
+_CREDENTIAL_CLIENTS = (
+    "github_collector",
+    "gitlab_collector",
+    "jenkins_collector",
+    "bamboo_collector",
+    "azure_devops_collector",
+    "argocd_collector",
+    "aws_collector",
+    "gcp_collector",
+    "azure_collector",
+    "github_tools",
+    "cicd_tools",
+    "cloud_tools",
+    "argocd_tools",
+    "k8s_collector",
+    "k8s_tools",
+    "helm_tools",
+)
+
+
+def _refresh_client(client: object) -> None:
+    refresh = getattr(client, "refresh_credentials", None)
+    if callable(refresh):
+        refresh()
+        return
+    reset = getattr(client, "reset", None)
+    if callable(reset):
+        reset()
+
+
 def refresh_agent_credentials(agent: object) -> None:
-    """Re-read env-backed clients after org_credentials overlay."""
+    """Re-read env-backed clients after an org credential overlay."""
     if hasattr(agent, "client"):
         agent.client = None
-    if hasattr(agent, "github_collector") and hasattr(agent.github_collector, "refresh_credentials"):
-        agent.github_collector.refresh_credentials()
-    if hasattr(agent, "k8s_collector") and hasattr(agent.k8s_collector, "reset"):
-        agent.k8s_collector.reset()
+    for name in _CREDENTIAL_CLIENTS:
+        client = getattr(agent, name, None)
+        if client is not None:
+            _refresh_client(client)
