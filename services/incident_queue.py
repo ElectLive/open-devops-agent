@@ -42,25 +42,26 @@ class IncidentQueue:
         return incident_id
 
     def claim_next(self, org_id: str) -> Optional[Dict[str, Any]]:
+        """Claim one pending incident. A second caller cannot receive the same id."""
         prefix = self.storage.org_prefix(org_id, "queue", QUEUE_PENDING)
-        keys = self.storage.list_keys(prefix)
-        if not keys:
-            return None
+        for key in self.storage.list_keys(prefix):
+            entry = self.storage.get_json(key)
+            if not entry:
+                continue
 
-        key = keys[0]
-        entry = self.storage.get_json(key)
-        if not entry:
-            return None
+            incident_id = entry["incident_id"]
+            entry["status"] = QUEUE_PROCESSING
+            entry["claimed_at"] = datetime.now(timezone.utc).isoformat()
+            entry["attempts"] = entry.get("attempts", 0) + 1
 
-        incident_id = entry["incident_id"]
-        entry["status"] = QUEUE_PROCESSING
-        entry["claimed_at"] = datetime.now(timezone.utc).isoformat()
-        entry["attempts"] = entry.get("attempts", 0) + 1
-
-        proc_key = self.storage.queue_key(org_id, QUEUE_PROCESSING, incident_id)
-        self.storage.put_json(proc_key, entry)
-        self.storage.delete(key)
-        return entry
+            proc_key = self.storage.queue_key(org_id, QUEUE_PROCESSING, incident_id)
+            if not self.storage.put_json_if_absent(proc_key, entry):
+                continue
+            if not self.storage.delete(key):
+                self.storage.delete(proc_key)
+                continue
+            return entry
+        return None
 
     def recover_stale_processing(self, org_id: str) -> int:
         """Move processing items back to pending (e.g. after crash mid-run)."""

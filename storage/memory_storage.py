@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from typing import Any, Dict, List, Optional
 
 from storage.base import StorageProvider
@@ -12,6 +13,7 @@ class MemoryStorage(StorageProvider):
 
     def __init__(self):
         self._objects: Dict[str, bytes] = {}
+        self._lock = threading.Lock()
 
     def put_bytes(self, key: str, data: bytes, content_type: str = "application/octet-stream") -> str:
         self._objects[key] = data
@@ -32,11 +34,20 @@ class MemoryStorage(StorageProvider):
     def list_keys(self, prefix: str) -> List[str]:
         return sorted(k for k in self._objects if k.startswith(prefix))
 
-    def delete(self, key: str) -> bool:
-        if key in self._objects:
-            del self._objects[key]
+    def put_json_if_absent(self, key: str, data: Any) -> bool:
+        payload = json.dumps(data, indent=2, default=str).encode("utf-8")
+        with self._lock:
+            if key in self._objects:
+                return False
+            self._objects[key] = payload
             return True
-        return False
+
+    def delete(self, key: str) -> bool:
+        with self._lock:
+            if key in self._objects:
+                del self._objects[key]
+                return True
+            return False
 
     def exists(self, key: str) -> bool:
         return key in self._objects
