@@ -607,7 +607,7 @@ async def bitbucket_webhook(
     _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature)
     payload = _parse_json_body(body)
     event = (x_event_key or "").lower()
-    if event.startswith("pullrequest:") or payload.get("pullrequest"):
+    if event in ("pullrequest:created", "pullrequest:updated"):
         pr = payload.get("pullrequest") or {}
         if pr.get("draft") or (pr.get("state") or "").upper() == "DRAFT":
             return {"status": "ignored", "reason": "draft_pr"}
@@ -628,6 +628,7 @@ async def bitbucket_webhook(
             "html_url": (pr.get("links") or {}).get("html", {}).get("href"),
             "base_ref": ((pr.get("destination") or {}).get("branch") or {}).get("name"),
             "head_ref": ((pr.get("source") or {}).get("branch") or {}).get("name"),
+            "head_sha": ((pr.get("source") or {}).get("commit") or {}).get("hash"),
             "labels": {"pull_request": "true", "code_review": "true"},
         }
         if not context["change_id"] or not context["repo"]:
@@ -635,7 +636,7 @@ async def bitbucket_webhook(
         incident_id = await enqueue_incident(context)
         return {"status": "queued", "type": "code_review", "incident_id": incident_id}
 
-    return {"status": "ignored", "event": event}
+    return {"status": "ignored", "reason": "unsupported_event", "event": event}
 
 
 @app.post("/webhook/manual")

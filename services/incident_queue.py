@@ -4,6 +4,8 @@ Survives process restarts — pending incidents are re-processed on startup.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -36,8 +38,35 @@ class IncidentQueue:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "attempts": 0,
         }
+        review_key = None
+        identity = [
+            org_id,
+            context.get("scm_platform"),
+            context.get("repo"),
+            context.get("change_id"),
+            context.get("head_sha"),
+        ]
+        if context.get("type") == "code_review" and all(identity):
+            digest = hashlib.sha256(
+                json.dumps(identity, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            # Keep the head reservation when the incident moves between queue states.
+            review_key = self.storage.org_prefix(org_id, "review_heads", f"{digest}.json")
+            if not self.storage.put_json_if_absent(review_key, {"incident_id": incident_id}):
+                existing = self.storage.get_json(review_key)
+                log.info(
+                    "Review head already queued",
+                    incident_id=existing["incident_id"],
+                    org_id=org_id,
+                )
+                return existing["incident_id"]
         key = self.storage.queue_key(org_id, QUEUE_PENDING, incident_id)
-        self.storage.put_json(key, entry)
+        try:
+            self.storage.put_json(key, entry)
+        except Exception:
+            if review_key:
+                self.storage.delete(review_key)
+            raise
         log.info("Incident enqueued", incident_id=incident_id, org_id=org_id)
         return incident_id
 

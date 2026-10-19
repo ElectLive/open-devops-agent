@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,6 +17,8 @@ from api.webhook_auth import (
     verify_slack_signature,
     verify_webhook_request,
 )
+from services.incident_queue import IncidentQueue
+from storage.memory_storage import MemoryStorage
 from tools.executor import SafeExecutor
 from tools.safety import requires_configured_approval
 from tools.ssh_utils import build_ssh_command
@@ -301,3 +304,177 @@ class TestWebhookEndpoints:
             headers={"X-Hub-Signature-256": sig},
         )
         assert response.status_code == 400
+
+
+@pytest.fixture
+def bitbucket_request(monkeypatch):
+    from api.server import app
+
+    signing_key = os.urandom(32)
+    monkeypatch.setenv("WEBHOOK_SECRET", signing_key.hex())
+
+    def post(payload, event="pullrequest:created", org_id="tenant-ember"):
+        body = json.dumps(payload).encode()
+        signature = "sha256=" + hmac.new(
+            signing_key.hex().encode(), body, hashlib.sha256
+        ).hexdigest()
+        headers = {"X-Hub-Signature-256": signature, "X-Org-ID": org_id}
+        if event is not None:
+            headers["X-Event-Key"] = event
+        return TestClient(app).post("/webhook/bitbucket", content=body, headers=headers)
+
+    return post
+
+
+@pytest.fixture
+def bitbucket_payload():
+    return {
+        "repository": {
+            "workspace": {"slug": "workspace-cedar"},
+            "slug": "repository-maple",
+        },
+        "pullrequest": {
+            "id": 731,
+            "title": "Review this change",
+            "source": {
+                "branch": {"name": "feature"},
+                "commit": {"hash": "commit-juniper"},
+            },
+            "destination": {"branch": {"name": "main"}},
+        },
+    }
+
+
+@pytest.fixture
+def review_queue(monkeypatch):
+    queue = IncidentQueue(MemoryStorage())
+    monkeypatch.setattr("api.server.incident_queue", queue)
+    return queue
+
+
+class TestBitbucketReviewTriggers:
+    @pytest.mark.parametrize(
+        "event",
+        [
+            "pullrequest:comment_created",
+            "pullrequest:fulfilled",
+            "pullrequest:rejected",
+            None,
+        ],
+    )
+    def test_ignores_non_review_events(self, bitbucket_request, bitbucket_payload, event):
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            response = bitbucket_request(bitbucket_payload, event)
+            assert response.status_code == 200
+            assert response.json()["status"] == "ignored"
+            assert enqueue.call_count == 0
+
+            response = bitbucket_request(bitbucket_payload)
+            assert response.status_code == 200
+            assert response.json()["status"] == "queued"
+            assert enqueue.call_count == 1
+
+    @pytest.mark.parametrize("event", ["pullrequest:created", "pullrequest:updated"])
+    def test_reviews_only_ready_prs_and_records_head(
+        self, bitbucket_request, bitbucket_payload, event
+    ):
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            for draft in ({"draft": True}, {"state": "DRAFT"}):
+                payload = dict(bitbucket_payload)
+                payload["pullrequest"] = {**bitbucket_payload["pullrequest"], **draft}
+                response = bitbucket_request(payload, event)
+                assert response.status_code == 200
+                assert response.json()["status"] == "ignored"
+                assert enqueue.call_count == 0
+
+            response = bitbucket_request(bitbucket_payload, event)
+            assert response.status_code == 200
+            assert response.json()["status"] == "queued"
+            assert response.json()["type"] == "code_review"
+            assert enqueue.call_count == 1
+            context = enqueue.call_args.args[0]
+            assert context.get("head_sha") == "commit-juniper"
+            assert context["type"] == "code_review"
+
+    @pytest.mark.parametrize("state", ["pending", "processing", "completed", "failed"])
+    def test_duplicate_head_across_queue_states(
+        self, bitbucket_request, bitbucket_payload, review_queue, state
+    ):
+        first = bitbucket_request(bitbucket_payload)
+        assert first.status_code == 200
+        assert first.json()["status"] == "queued"
+        incident_id = first.json()["incident_id"]
+        if state != "pending":
+            entry = review_queue.claim_next("tenant-ember")
+            assert entry["incident_id"] == incident_id
+        if state == "completed":
+            review_queue.mark_completed("tenant-ember", incident_id, {})
+        elif state == "failed":
+            review_queue.mark_failed("tenant-ember", incident_id, "review unavailable")
+
+        bitbucket_payload["pullrequest"]["title"] = "Edited review title"
+        repeat = bitbucket_request(bitbucket_payload, "pullrequest:updated")
+        assert repeat.status_code == 200
+        keys = review_queue.storage.list_keys("tenant-ember/queue/")
+        assert len(keys) == 1
+        entry = review_queue.storage.get_json(keys[0])
+        assert entry["status"] == state
+        assert entry["context"].get("head_sha") == "commit-juniper"
+
+    @pytest.mark.parametrize("field", ["org_id", "repo", "change_id", "head_sha"])
+    def test_distinct_review_identity_enqueues_separately(
+        self, bitbucket_request, bitbucket_payload, review_queue, field
+    ):
+        first = bitbucket_request(bitbucket_payload)
+        bitbucket_request(bitbucket_payload)
+        assert len(review_queue.storage.list_keys("tenant-ember/queue/")) == 1
+
+        org_id = "tenant-ember"
+        if field == "org_id":
+            org_id = "tenant-birch"
+        elif field == "repo":
+            bitbucket_payload["repository"]["slug"] = "repository-willow"
+        elif field == "change_id":
+            bitbucket_payload["pullrequest"]["id"] = 845
+        else:
+            bitbucket_payload["pullrequest"]["source"]["commit"]["hash"] = "commit-spruce"
+        second = bitbucket_request(bitbucket_payload, "pullrequest:updated", org_id)
+        assert first.status_code == second.status_code == 200
+        assert second.json()["status"] == "queued"
+        assert first.json()["incident_id"] != second.json()["incident_id"]
+        bitbucket_request(bitbucket_payload, "pullrequest:updated", org_id)
+        keys = [key for key in review_queue.storage.list_keys("") if "/queue/" in key]
+        assert len(keys) == 2
+        assert {review_queue.storage.get_json(key)["org_id"] for key in keys} == {
+            "tenant-ember",
+            org_id,
+        }
+
+    def test_concurrent_duplicate_deliveries_enqueue_once(
+        self, bitbucket_request, bitbucket_payload, review_queue
+    ):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            responses = list(
+                executor.map(lambda _: bitbucket_request(bitbucket_payload), range(8))
+            )
+        assert all(response.status_code == 200 for response in responses)
+        assert len(review_queue.storage.list_keys("tenant-ember/queue/")) == 1
+
+    def test_shared_dedupe_includes_provider(self, review_queue):
+        context = {
+            "type": "code_review",
+            "scm_platform": "bitbucket",
+            "repo": "workspace-cedar/repository-maple",
+            "change_id": "731",
+            "head_sha": "commit-juniper",
+        }
+        first = review_queue.enqueue("tenant-ember", context)
+        review_queue.enqueue("tenant-ember", context)
+        assert len(review_queue.storage.list_keys("tenant-ember/queue/")) == 1
+        second = review_queue.enqueue("tenant-ember", {**context, "scm_platform": "gitlab"})
+        assert first != second
+        assert len(review_queue.storage.list_keys("tenant-ember/queue/")) == 2
