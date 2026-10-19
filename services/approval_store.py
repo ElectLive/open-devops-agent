@@ -9,6 +9,9 @@ from uuid import uuid4
 from services.org_context import current_org_id
 from storage import factory
 from storage.base import StorageProvider
+from storage.azure_storage import AzureBlobStorage
+from storage.gcs_storage import GCSStorage
+from storage.memory_storage import MemoryStorage
 from storage.s3_storage import S3Storage
 
 APPROVAL_REFERENCE_PREFIX = "agent-approval:"
@@ -53,6 +56,121 @@ class CommandApprovalStore:
 
     def _prefix(self) -> str:
         return self.storage.org_prefix(current_org_id(), "approvals") + "/"
+
+    def _replace_s3(self, key: str, record: dict, etag: str) -> bool:
+        """Replace an existing object version; never create a missing object."""
+        from botocore.exceptions import ClientError, ParamValidationError
+
+        try:
+            self.storage._client.put_object(
+                Bucket=self.storage.bucket,
+                Key=key,
+                Body=json.dumps(record, indent=2).encode(),
+                ContentType="application/json",
+                IfMatch=etag,
+            )
+            return True
+        except ParamValidationError as exc:
+            raise RuntimeError(
+                "Approval storage requires atomic conditional replacement"
+            ) from exc
+        except ClientError as exc:
+            if exc.response.get("Error", {}).get("Code") in {
+                "PreconditionFailed",
+                "ConditionalRequestConflict",
+                "NoSuchKey",
+                "404",
+            }:
+                return False
+            raise
+
+    def _consume_existing(self, key: str, expected: dict) -> bool:
+        """Grant execution only by atomically consuming the current payload.
+
+        Cached data and a missing claim marker convey no authority. Cloud
+        replacement requires the version of a still-existing matching payload;
+        deleting the resulting terminal record cannot restore that version.
+        """
+        if isinstance(self.storage, MemoryStorage):
+            with self.storage._lock:
+                raw = self.storage._objects.get(key)
+                if raw is None or json.loads(raw) != expected:
+                    return False
+                del self.storage._objects[key]
+                return True
+
+        terminal = {"consumed": True, "expires_at": expected["expires_at"]}
+        if isinstance(self.storage, S3Storage):
+            from botocore.exceptions import ClientError
+
+            try:
+                response = self.storage._client.get_object(
+                    Bucket=self.storage.bucket, Key=key
+                )
+                if json.loads(response["Body"].read()) != expected:
+                    return False
+                return self._replace_s3(key, terminal, response["ETag"])
+            except self.storage._client.exceptions.NoSuchKey:
+                return False
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") in {"NoSuchKey", "404"}:
+                    return False
+                raise
+
+        if isinstance(self.storage, GCSStorage):
+            from google.api_core.exceptions import NotFound, PreconditionFailed
+
+            try:
+                blob = self.storage._bucket.blob(key)
+                blob.reload()
+                generation = blob.generation
+                if not generation:
+                    raise RuntimeError(
+                        "Approval storage requires an existing object generation"
+                    )
+                raw = blob.download_as_bytes(if_generation_match=generation)
+                if json.loads(raw) != expected:
+                    return False
+                blob.upload_from_string(
+                    json.dumps(terminal),
+                    content_type="application/json",
+                    if_generation_match=generation,
+                )
+                return True
+            except (NotFound, PreconditionFailed):
+                return False
+
+        if isinstance(self.storage, AzureBlobStorage):
+            from azure.core import MatchConditions
+            from azure.core.exceptions import (
+                ResourceModifiedError,
+                ResourceNotFoundError,
+            )
+
+            try:
+                blob = self.storage._container_client.get_blob_client(key)
+                etag = blob.get_blob_properties().etag
+                if not etag:
+                    raise RuntimeError(
+                        "Approval storage requires an existing object ETag"
+                    )
+                raw = blob.download_blob(
+                    etag=etag, match_condition=MatchConditions.IfNotModified
+                ).readall()
+                if json.loads(raw) != expected:
+                    return False
+                blob.upload_blob(
+                    json.dumps(terminal).encode(),
+                    overwrite=True,
+                    etag=etag,
+                    match_condition=MatchConditions.IfNotModified,
+                )
+                return True
+            except (ResourceModifiedError, ResourceNotFoundError):
+                return False
+        raise RuntimeError(
+            "Approval storage requires atomic consumption of existing state"
+        )
 
     def cleanup(self) -> None:
         """Reclaim expired payloads/claims and old admission slots on access."""
@@ -106,6 +224,17 @@ class CommandApprovalStore:
             ):
                 continue
             key = prefix + identifier + ".json"
+            if isinstance(self.storage, S3Storage):
+                # Some compatible servers accept If-Match on an absent key.
+                # Verify this essential fencing precondition before retaining
+                # executable content; a successful missing-key write is unsafe.
+                if self._replace_s3(
+                    key, {"expires_at": expires_at}, '"' + "0" * 32 + '"'
+                ):
+                    self.storage.delete(key)
+                    raise RuntimeError(
+                        "Approval storage lacks atomic existing-object replacement"
+                    )
             self.storage.put_json(key, record)
             if time.time() >= expires_at:
                 self.storage.delete(key)
@@ -118,8 +247,8 @@ class CommandApprovalStore:
     def resolve(self, reference: str) -> Optional[str]:
         """Atomically spend a matching, unexpired reference before execution.
 
-        A failed execution also spends the reference. Claim markers remain until
-        expiry so a resolver paused before another caller's claim cannot replay.
+        A failed execution also spends the reference. Consumption requires
+        authoritative payload state, independently of wall clocks and cleanup.
         """
         self.cleanup()
         if not reference.startswith(APPROVAL_REFERENCE_PREFIX):
@@ -147,11 +276,9 @@ class CommandApprovalStore:
         command = record.get("command")
         if not isinstance(command, str) or not command:
             return None
-        if not self._create_atomically(
-            prefix + identifier + ".claim", {"expires_at": expires_at}
-        ):
+        if not self._consume_existing(key, record):
             return None
-        # A caller may have paused across expiry before acquiring its claim.
+        # A caller may have paused across expiry before consuming the payload.
         if time.time() >= expires_at:
             self.storage.delete(key)
             return None

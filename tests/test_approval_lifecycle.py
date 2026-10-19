@@ -3,6 +3,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import io
+import itertools
 import json
 import sys
 import threading
@@ -41,12 +42,30 @@ def backend(request, monkeypatch):
     if request.param == "memory":
         return objects, objects
 
-    def create(key, body, conditional):
-        if conditional:
-            if not objects.put_json_if_absent(key, json.loads(body)):
+    versions = {}
+    generation = itertools.count(1)
+
+    def snapshot(key):
+        with objects._lock:
+            return objects._objects.get(key), versions.get(key)
+
+    def create(key, body, conditional, expected=None):
+        hook = getattr(objects, "before_conditional_write", None)
+        if expected is not None and hook is not None:
+            objects.before_conditional_write = None
+            hook(key)
+        with objects._lock:
+            if conditional and key in objects._objects:
                 raise ConditionalConflict()
-        else:
-            objects.put_bytes(key, body if isinstance(body, bytes) else body.encode())
+            if expected is not None and versions.get(key) != expected:
+                raise ConditionalConflict()
+            objects._objects[key] = body if isinstance(body, bytes) else body.encode()
+            versions[key] = next(generation)
+
+    def remove(key):
+        with objects._lock:
+            objects._objects.pop(key, None)
+            versions.pop(key, None)
 
     if request.param in {"s3", "minio"}:
 
@@ -54,26 +73,35 @@ def backend(request, monkeypatch):
             exceptions = SimpleNamespace(NoSuchKey=ConditionalConflict)
 
             def put_object(self, *, Bucket, Key, Body, ContentType, **kwargs):
-                assert set(kwargs) <= {"IfNoneMatch"}
+                assert set(kwargs) <= {"IfNoneMatch", "IfMatch"}
                 try:
-                    create(Key, Body, kwargs.get("IfNoneMatch") == "*")
+                    create(
+                        Key,
+                        Body,
+                        kwargs.get("IfNoneMatch") == "*",
+                        (
+                            int(kwargs["IfMatch"])
+                            if kwargs.get("IfMatch", "").isdigit()
+                            else (-1 if "IfMatch" in kwargs else None)
+                        ),
+                    )
                 except ConditionalConflict:
                     raise ClientError(
                         {"Error": {"Code": "PreconditionFailed"}}, "PutObject"
                     ) from None
 
             def get_object(self, *, Bucket, Key):
-                body = objects.get_bytes(Key)
+                body, version = snapshot(Key)
                 if body is None:
                     raise ConditionalConflict()
-                return {"Body": io.BytesIO(body)}
+                return {"Body": io.BytesIO(body), "ETag": str(version)}
 
             def head_object(self, *, Bucket, Key):
                 if not objects.exists(Key):
                     raise ConditionalConflict()
 
             def delete_object(self, *, Bucket, Key):
-                objects.delete(Key)
+                remove(Key)
 
             def get_paginator(self, operation):
                 assert operation == "list_objects_v2"
@@ -106,8 +134,18 @@ def backend(request, monkeypatch):
             monkeypatch.setitem(sys.modules, package, module)
     module = ModuleType(module_name)
     module.PreconditionFailed = ConditionalConflict
+    module.NotFound = ConditionalConflict
     module.ResourceExistsError = ConditionalConflict
+    module.ResourceNotFoundError = ConditionalConflict
+    module.ResourceModifiedError = ConditionalConflict
     monkeypatch.setitem(sys.modules, module_name, module)
+    if request.param == "azure":
+        monkeypatch.setattr(
+            sys.modules["azure.core"],
+            "MatchConditions",
+            SimpleNamespace(IfNotModified="if-not-modified"),
+            raising=False,
+        )
 
     class Blob:
         def __init__(self, key):
@@ -117,20 +155,51 @@ def backend(request, monkeypatch):
             return objects.exists(self.key)
 
         def upload_from_string(self, body, content_type, **kwargs):
-            assert kwargs in ({}, {"if_generation_match": 0})
-            create(self.key, body, kwargs.get("if_generation_match") == 0)
+            assert set(kwargs) <= {"if_generation_match"}
+            version = kwargs.get("if_generation_match")
+            create(self.key, body, version == 0, version if version else None)
 
-        def upload_blob(self, body, overwrite, content_type):
-            create(self.key, body, not overwrite)
+        def upload_blob(self, body, overwrite, content_type=None, **kwargs):
+            assert set(kwargs) <= {"etag", "match_condition"}
+            if "etag" in kwargs:
+                assert kwargs["match_condition"] == "if-not-modified"
+            create(
+                self.key,
+                body,
+                not overwrite,
+                int(kwargs["etag"]) if "etag" in kwargs else None,
+            )
 
-        def download_as_bytes(self):
-            return objects.get_bytes(self.key)
+        def reload(self):
+            body, version = snapshot(self.key)
+            if body is None:
+                raise ConditionalConflict()
+            self.generation = version
 
-        def download_blob(self):
-            return SimpleNamespace(readall=self.download_as_bytes)
+        def download_as_bytes(self, **kwargs):
+            body, version = snapshot(self.key)
+            assert set(kwargs) <= {"if_generation_match"}
+            if body is None or kwargs.get("if_generation_match", version) != version:
+                raise ConditionalConflict()
+            return body
+
+        def get_blob_properties(self):
+            body, version = snapshot(self.key)
+            if body is None:
+                raise ConditionalConflict()
+            return SimpleNamespace(etag=str(version))
+
+        def download_blob(self, **kwargs):
+            body, version = snapshot(self.key)
+            assert set(kwargs) <= {"etag", "match_condition"}
+            if body is None or kwargs.get("etag", str(version)) != str(version):
+                raise ConditionalConflict()
+            if "etag" in kwargs:
+                assert kwargs["match_condition"] == "if-not-modified"
+            return SimpleNamespace(readall=lambda: body)
 
         def delete(self):
-            objects.delete(self.key)
+            remove(self.key)
 
         delete_blob = delete
 
@@ -233,14 +302,15 @@ def test_contender_paused_past_expiry_cannot_execute(clock, monkeypatch):
     store = CommandApprovalStore(storage)
     reference = store.retain("late-command")
     clock[0] += 3599
-    original = storage.put_json_if_absent
+    original = storage.get_json
 
-    def pause_before_claim(key, record):
-        if key.endswith(".claim"):
+    def pause_before_claim(key):
+        record = original(key)
+        if isinstance(record, dict) and "command" in record:
             clock[0] += 2
-        return original(key, record)
+        return record
 
-    monkeypatch.setattr(storage, "put_json_if_absent", pause_before_claim)
+    monkeypatch.setattr(storage, "get_json", pause_before_claim)
     assert store.resolve(reference) is None
     assert b"late-command" not in retained_bytes(storage)
 
@@ -390,3 +460,137 @@ def test_s3_sdk_without_conditions_is_refused_instead_of_using_fallback(clock):
     )
     with pytest.raises(RuntimeError, match="atomic"):
         CommandApprovalStore(storage).retain("must-not-be-approved")
+
+
+@pytest.mark.parametrize(
+    "reclaim", [False, True], ids=["before-cleanup-control", "after-cleanup"]
+)
+@pytest.mark.parametrize("clock_mode", ["offset", "step-back"])
+def test_stale_reader_cannot_execute_after_terminal_state_reclamation(
+    backend, monkeypatch, reclaim, clock_mode
+):
+    """Two execution boundaries from one reference are forbidden, across clocks."""
+    storage, _ = backend
+    from tools.executor import SafeExecutor
+
+    worker = threading.local()
+    start = 1_800_000_000.0
+    worker.now = start
+    monkeypatch.setattr(
+        approval_store, "time", SimpleNamespace(time=lambda: worker.now)
+    )
+    monkeypatch.setattr("storage.factory.get_storage", lambda: storage)
+    monkeypatch.delenv("AGENT_EMERGENCY_STOP", raising=False)
+    reference = CommandApprovalStore(storage).retain("exact-retained-operation")
+    reader_has_payload = threading.Event()
+    resume_reader = threading.Event()
+    original_read = storage.get_json
+
+    def pause_cached_reader(key):
+        record = original_read(key)
+        if (
+            getattr(worker, "reader", False)
+            and isinstance(record, dict)
+            and "command" in record
+        ):
+            reader_has_payload.set()
+            assert resume_reader.wait(timeout=10)
+            if clock_mode == "step-back":
+                worker.now = start + 3590
+        return record
+
+    monkeypatch.setattr(storage, "get_json", pause_cached_reader)
+    executor = SafeExecutor()
+    executed = []
+    execution_lock = threading.Lock()
+
+    async def execute(command, host=None):
+        assert command == "exact-retained-operation"
+        with execution_lock:
+            executed.append(command)
+        return {"success": True, "returncode": 0}
+
+    monkeypatch.setattr(executor, "_exec", execute)
+
+    def stale_reader():
+        worker.reader = True
+        worker.now = start + 3599
+        return asyncio.run(executor.run(reference))
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(stale_reader)
+        try:
+            assert reader_has_payload.wait(timeout=10)
+            worker.now = start + 3599
+            winner = asyncio.run(executor.run(reference))
+            assert winner["success"] is True
+            # Negative control: a repeat is already blocked before reclamation.
+            repeat = asyncio.run(executor.run(reference))
+            assert repeat["blocked"] is True
+            assert len(executed) == 1
+            if reclaim:
+                worker.now = start + 3601
+                CommandApprovalStore(storage).cleanup()
+        finally:
+            resume_reader.set()
+        loser = pending.result(timeout=10)
+
+    assert len(executed) == 1, (executed, loser)
+    assert loser.get("blocked") is True
+    assert loser.get("success") is False
+    assert loser.get("returncode") == 1
+
+
+def test_s3_compatible_server_that_creates_on_missing_if_match_is_refused(clock):
+    objects = MemoryStorage()
+    storage = S3Storage.__new__(S3Storage)
+    storage.bucket = "approval-fixture"
+
+    def broken_put(*, Bucket, Key, Body, ContentType, **kwargs):
+        # Model a server violating the required If-Match-on-missing contract.
+        if "IfMatch" in kwargs:
+            objects.put_bytes(Key, Body)
+        elif not objects.put_json_if_absent(Key, json.loads(Body)):
+            raise ClientError({"Error": {"Code": "PreconditionFailed"}}, "PutObject")
+
+    storage._client = SimpleNamespace(
+        put_object=broken_put,
+        get_paginator=lambda operation: SimpleNamespace(paginate=lambda **kw: []),
+        head_object=lambda **kw: None,
+        delete_object=lambda **kw: objects.delete(kw["Key"]),
+    )
+    with pytest.raises(RuntimeError, match="atomic"):
+        CommandApprovalStore(storage).retain("must-not-be-approved")
+    assert b"must-not-be-approved" not in retained_bytes(objects)
+
+
+@pytest.mark.parametrize("transition", ["removed", "changed"])
+def test_consumption_requires_the_current_payload_at_the_atomic_boundary(
+    backend, clock, monkeypatch, transition
+):
+    storage, objects = backend
+    reference = CommandApprovalStore(storage).retain("operation-must-not-execute")
+
+    def revoke(key):
+        if transition == "removed":
+            storage.delete(key)
+        else:
+            storage.put_json(key, {"consumed": True})
+
+    if isinstance(storage, MemoryStorage):
+        original = storage.get_json
+
+        def read_then_revoke(key):
+            cached = original(key)
+            if isinstance(cached, dict) and "command" in cached:
+                revoke(key)
+            return cached
+
+        monkeypatch.setattr(storage, "get_json", read_then_revoke)
+    else:
+        # Revoke after the native version/body read, immediately before the
+        # conditional write is evaluated by the simulated object server.
+        objects.before_conditional_write = revoke
+
+    assert CommandApprovalStore(storage).resolve(reference) is None
+    assert b"operation-must-not-execute" not in retained_bytes(objects)
