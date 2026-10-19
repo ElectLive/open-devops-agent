@@ -13,7 +13,8 @@ All incident data is **org-scoped** and stored in cloud object storage (S3, MinI
 | `/health`, `/audit` | None (restrict in production via network policy) |
 | `/orgs/*` | None by default — add API gateway auth in production |
 | `/webhook/github` | `X-Hub-Signature-256` when `WEBHOOK_SECRET` is set |
-| `/webhook/manual`, `/webhook/alertmanager` | `X-Hub-Signature-256` **or** `X-Webhook-Signature` when `WEBHOOK_SECRET` is set |
+| `/webhook/manual` | `X-Hub-Signature-256` **or** `X-Webhook-Signature` when `WEBHOOK_SECRET` is set |
+| `/webhook/alertmanager`, `/webhook/grafana` | HMAC signature as above, **or** `Authorization: Bearer <WEBHOOK_SECRET>` (Alertmanager and Grafana cannot sign bodies) |
 | `/slack/action` | `X-Slack-Signature` + `X-Slack-Request-Timestamp` when `SLACK_SIGNING_SECRET` is set (configured in Slack app settings) |
 
 `X-Org-ID` is **not** authentication — it only selects the organization (see
@@ -38,6 +39,8 @@ curl -X POST http://localhost:8000/webhook/manual \
 - `/webhook/manual` and `/webhook/alertmanager` accept either header, but `X-Hub-Signature-256`
   **takes precedence**: if it is present and invalid, `X-Webhook-Signature` is not consulted and the
   request is rejected. `/webhook/github` accepts only `X-Hub-Signature-256`.
+- `/webhook/alertmanager` and `/webhook/grafana` also accept `Authorization: Bearer <WEBHOOK_SECRET>`,
+  compared in constant time. A valid bearer token is accepted even if a signature header is also present.
 - When `WEBHOOK_SECRET` is unset or empty, signature verification is skipped entirely and unsigned
   requests are accepted. Leave it unset only for local testing.
 
@@ -326,6 +329,36 @@ signature header as shown under [Webhook signatures](#webhook-signatures).
 
 ---
 
+### `POST /webhook/grafana`
+
+Receive Grafana Alerting notifications (webhook contact point). Same payload shape as Alertmanager,
+plus Grafana fields.
+
+**Headers:**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Content-Type` | Yes | `application/json` |
+| `Authorization` | If `WEBHOOK_SECRET` set (or sign instead) | `Bearer <WEBHOOK_SECRET>` — contact point → Optional settings → Authorization Header |
+| `X-Hub-Signature-256` or `X-Webhook-Signature` | Alternative to `Authorization` | HMAC SHA-256 of the raw body |
+| `X-Org-ID` | No | Organization ID (Grafana's numeric `orgId` is not used) |
+
+Each `firing` alert is queued with `source: "grafana"`, the labels/annotations fields used for
+Alertmanager, and `dashboard_url`, `panel_url`, `runbook_url`, `alert_values`, `starts_at`.
+
+**Logs:** when `GRAFANA_URL` + `GRAFANA_LOKI_DATASOURCE_UID` (or `LOKI_URL`) are set, the agent attaches
+`alert_logs` to the incident before diagnosis: up to 100 error-like lines from Loki, from 15 minutes
+before `startsAt` (capped at 24 hours). The stream selector comes from the alert's `namespace`+`pod`,
+`namespace`+`container`, `namespace`+`app`, `job`, `app`, `service_name`, `service` or `host` labels, in
+that order; a `logql` annotation overrides it. The agent can run further LogQL with the read-only
+`query_logs` tool.
+
+**Response 200:** `{"status": "queued", "incident_ids": ["..."]}`
+
+**Response 401:** Missing or invalid bearer token / signature (when `WEBHOOK_SECRET` is set).
+
+---
+
 ### `POST /webhook/alertmanager`
 
 Receive Prometheus Alertmanager alerts.
@@ -335,10 +368,12 @@ Receive Prometheus Alertmanager alerts.
 | Header | Required | Description |
 |--------|----------|-------------|
 | `Content-Type` | Yes | `application/json` |
-| `X-Hub-Signature-256` or `X-Webhook-Signature` | If `WEBHOOK_SECRET` set | HMAC SHA-256 signature of the raw body (see [Webhook signatures](#webhook-signatures)) |
+| `Authorization` | If `WEBHOOK_SECRET` set (or sign instead) | `Bearer <WEBHOOK_SECRET>` — set via `http_config.authorization` in `alertmanager.yml` |
+| `X-Hub-Signature-256` or `X-Webhook-Signature` | Alternative to `Authorization` | HMAC SHA-256 signature of the raw body (see [Webhook signatures](#webhook-signatures)) |
 | `X-Org-ID` | No | Organization ID |
 
-**Request body:** Standard Alertmanager webhook JSON.
+**Request body:** Standard Alertmanager webhook JSON. Only `firing` alerts are queued. An alert
+annotation `logql` (or `loki_query`) sets the Loki query used to attach logs; see `POST /webhook/grafana`.
 
 **Example:**
 

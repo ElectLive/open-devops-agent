@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from agent.core import DevOpsAgent
 from agent.classifier import classify_issue
 from api.webhook_auth import (
+    bearer_token,
     get_webhook_secret,
     verify_slack_signature,
     verify_webhook_auth,
@@ -439,15 +440,45 @@ async def github_webhook(
     return {"status": "ignored", "event": x_github_event}
 
 
+def _alert_context(alert: dict, source: str, x_org_id: Optional[str]) -> dict:
+    """Incident context for one Alertmanager-format alert (also sent by Grafana)."""
+    labels = alert.get("labels") or {}
+    annotations = alert.get("annotations") or {}
+    alertname = labels.get("alertname", "")
+    return {
+        "type": _classify_alert(alertname, labels),
+        "source": source,
+        "org_id": x_org_id or labels.get("org_id") or os.getenv("ORG_ID", "default"),
+        "alertname": alertname,
+        "severity": labels.get("severity", "warning"),
+        "namespace": labels.get("namespace"),
+        "pod": labels.get("pod"),
+        "service": labels.get("service"),
+        "node": labels.get("node"),
+        "summary": annotations.get("summary", ""),
+        "description": annotations.get("description", ""),
+        "starts_at": alert.get("startsAt"),
+        "generator_url": alert.get("generatorURL"),
+        "logql": annotations.get("logql") or annotations.get("loki_query"),
+        "labels": labels,
+    }
+
+
 @app.post("/webhook/alertmanager")
 async def alertmanager_webhook(
     request: Request,
     x_org_id: str = Header(None, alias="X-Org-ID"),
     x_hub_signature_256: str = Header(None),
     x_webhook_signature: str = Header(None, alias="X-Webhook-Signature"),
+    authorization: str = Header(None),
 ):
+    """Alertmanager alerts. Auth: HMAC signature or `Authorization: Bearer <WEBHOOK_SECRET>`."""
     body = await request.body()
-    _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature)
+    _require_webhook_auth(
+        body,
+        signature=x_hub_signature_256 or x_webhook_signature,
+        static_token=bearer_token(authorization),
+    )
 
     payload = _parse_json_body(body)
     queued = []
@@ -455,28 +486,48 @@ async def alertmanager_webhook(
     for alert in payload.get("alerts", []):
         if alert.get("status") != "firing":
             continue
-
-        labels = alert.get("labels", {})
-        annotations = alert.get("annotations", {})
-        alertname = labels.get("alertname", "")
-        issue_type = _classify_alert(alertname, labels)
-
-        context = {
-            "type": issue_type,
-            "source": "alertmanager",
-            "org_id": x_org_id or labels.get("org_id") or os.getenv("ORG_ID", "default"),
-            "alertname": alertname,
-            "severity": labels.get("severity", "warning"),
-            "namespace": labels.get("namespace"),
-            "pod": labels.get("pod"),
-            "service": labels.get("service"),
-            "node": labels.get("node"),
-            "summary": annotations.get("summary", ""),
-            "description": annotations.get("description", ""),
-            "labels": labels,
-        }
-        incident_id = await enqueue_incident(context)
+        incident_id = await enqueue_incident(_alert_context(alert, "alertmanager", x_org_id))
         queued.append(incident_id)
+
+    return {"status": "queued", "incident_ids": queued}
+
+
+@app.post("/webhook/grafana")
+async def grafana_webhook(
+    request: Request,
+    x_org_id: str = Header(None, alias="X-Org-ID"),
+    x_hub_signature_256: str = Header(None),
+    x_webhook_signature: str = Header(None, alias="X-Webhook-Signature"),
+    authorization: str = Header(None),
+):
+    """Grafana Alerting webhook contact point.
+
+    Auth: `Authorization: Bearer <WEBHOOK_SECRET>` (set in the contact point's
+    Authorization header settings) or an HMAC signature.
+    """
+    body = await request.body()
+    _require_webhook_auth(
+        body,
+        signature=x_hub_signature_256 or x_webhook_signature,
+        static_token=bearer_token(authorization),
+    )
+
+    payload = _parse_json_body(body)
+    queued = []
+
+    for alert in payload.get("alerts", []):
+        if alert.get("status") != "firing":
+            continue
+        context = _alert_context(alert, "grafana", x_org_id)
+        context.update(
+            {
+                "dashboard_url": alert.get("dashboardURL"),
+                "panel_url": alert.get("panelURL"),
+                "alert_values": alert.get("values"),
+                "runbook_url": (alert.get("annotations") or {}).get("runbook_url"),
+            }
+        )
+        queued.append(await enqueue_incident(context))
 
     return {"status": "queued", "incident_ids": queued}
 

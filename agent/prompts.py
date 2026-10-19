@@ -179,7 +179,7 @@ Process:
 1. query_metrics (Prometheus/Grafana/Datadog/New Relic) for the symptom
 2. evaluate_slo with good_query + total_query when an SLO objective is known
 3. capacity_check for CPU/memory/disk pressure
-4. query_traces (Tempo/Jaeger/Datadog) if the issue is latency or errors
+4. query_traces (Tempo/Jaeger/Datadog) if the issue is latency or errors; query_logs (Loki via Grafana) for the error lines
 5. run_synthetic against the public URL to confirm user impact
 6. get_oncall_roster / assign_incident_commander from PagerDuty
 7. update_status_page when users are affected (investigating → resolved)
@@ -245,4 +245,13 @@ Do NOT query RDS, Cloud SQL, Azure SQL, DynamoDB, Cosmos DB, Redis, or ElastiCac
 For database-related alerts: troubleshoot at the application layer (connection pools, timeouts,
 service restarts, network/firewall rules) and notify the DBA team for manual investigation.
 The system will AUTO-ESCALATE database incidents to Jira/Zoho/email/Slack — do not attempt direct DB access."""
+
+    from tools.observability import default_log_provider
+    if default_log_provider():
+        prompt += """
+
+LOGS: Loki logs are available (via Grafana or directly). When the context has alert_logs, read them
+first — they are the error lines around the time the alert fired. Use query_logs (LogQL) to widen the
+window, drop the error filter, or look at upstream/downstream services before deciding on a fix.
+Quote the log lines that support your root cause."""
     return append_grounding_rules(prompt)

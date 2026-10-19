@@ -60,12 +60,26 @@ def verify_static_webhook_token(token: Optional[str], secret: Optional[str] = No
     return _signatures_equal(expected, token)
 
 
+def bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Token from an ``Authorization: Bearer <token>`` header, or None.
+
+    Alertmanager and Grafana cannot sign the request body; they send a fixed
+    bearer credential instead, which is checked like a static webhook token.
+    """
+    if not authorization:
+        return None
+    scheme, _, token = authorization.strip().partition(" ")
+    if scheme.lower() != "bearer":
+        return None
+    return token.strip() or None
+
+
 def verify_webhook_auth(
     payload: bytes,
     signature: Optional[str] = None,
     static_token: Optional[str] = None,
 ) -> bool:
-    """Accept HMAC signature or a static token (GitLab Secret token)."""
+    """Accept HMAC signature or a static token (GitLab Secret token, bearer token)."""
     secret = get_webhook_secret()
     if not secret:
         return True

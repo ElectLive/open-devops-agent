@@ -1,13 +1,15 @@
 """
 Observability and reliability operations.
 
-Prometheus/Grafana/Datadog/New Relic queries, SLO/error-budget math, capacity
-signals, traces, synthetic checks, PagerDuty on-call, Statuspage updates.
+Prometheus/Grafana/Datadog/New Relic queries, Loki logs (direct or via Grafana),
+SLO/error-budget math, capacity signals, traces, synthetic checks, PagerDuty
+on-call, Statuspage updates.
 """
 from __future__ import annotations
 
 import os
 import time
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urljoin
 
@@ -159,6 +161,106 @@ class ObservabilityTools:
         if backend == "datadog":
             return await self._datadog_traces(service, limit)
         return {"error": f"Unknown trace backend {backend!r}"}
+
+    async def query_logs(
+        self,
+        query: str,
+        provider: Optional[str] = None,
+        start: Optional[float] = None,
+        end: Optional[float] = None,
+        since_minutes: int = 30,
+        limit: int = 200,
+    ) -> dict:
+        """Run a LogQL query against Loki, through Grafana's datasource proxy or directly.
+
+        ``start``/``end`` are Unix seconds; without them the last ``since_minutes``
+        are searched. Returns the newest lines first.
+        """
+        provider = (provider or default_log_provider() or "").lower()
+        if provider == "grafana":
+            base = os.getenv("GRAFANA_URL", "").rstrip("/")
+            uid = os.getenv("GRAFANA_LOKI_DATASOURCE_UID", "").strip()
+            if not base or not uid:
+                return {"error": "GRAFANA_URL and GRAFANA_LOKI_DATASOURCE_UID must be set"}
+            url = f"{base}/api/datasources/proxy/uid/{uid}/loki/api/v1/query_range"
+            headers = _bearer("GRAFANA_TOKEN")
+        elif provider == "loki":
+            base = os.getenv("LOKI_URL", "").rstrip("/")
+            if not base:
+                return {"error": "LOKI_URL not configured"}
+            url = f"{base}/loki/api/v1/query_range"
+            headers = _bearer("LOKI_TOKEN")
+        else:
+            return {
+                "error": "No log provider configured. Set GRAFANA_URL + "
+                "GRAFANA_LOKI_DATASOURCE_UID, or LOKI_URL."
+            }
+
+        limit = max(1, min(int(limit or 200), 1000))
+        end = end if end is not None else time.time()
+        if start is None:
+            since = max(1, min(int(since_minutes or 30), 24 * 60))
+            start = end - since * 60
+        params = {
+            "query": query,
+            "start": str(int(start * 1e9)),
+            "end": str(int(end * 1e9)),
+            "limit": str(limit),
+            "direction": "backward",
+        }
+        payload = await self._get_json(url, params=params, headers=headers or None)
+        if payload.get("error"):
+            return payload
+        if payload.get("status") != "success":
+            return {"error": "Loki query failed", "raw": payload}
+
+        lines = []
+        for stream in (payload.get("data") or {}).get("result") or []:
+            stream_labels = stream.get("stream") or {}
+            for ts, line in stream.get("values") or []:
+                lines.append((int(ts), stream_labels, line))
+        lines.sort(key=lambda item: item[0], reverse=True)
+        lines = lines[:limit]
+        return {
+            "success": True,
+            "provider": provider,
+            "query": query,
+            "line_count": len(lines),
+            "lines": [
+                {
+                    "ts": datetime.fromtimestamp(ts / 1e9, tz=timezone.utc).isoformat(),
+                    "labels": stream_labels,
+                    "line": line[:MAX_LOG_LINE_CHARS],
+                }
+                for ts, stream_labels, line in lines
+            ],
+        }
+
+    async def logs_for_alert(self, context: dict, limit: int = 100) -> Optional[dict]:
+        """Recent error logs for an alert, or None when logs or a selector are unavailable.
+
+        Uses the alert's ``logql`` annotation when present; otherwise builds a
+        stream selector from its labels and keeps error-like lines.
+        """
+        if not default_log_provider():
+            return None
+        query = context.get("logql")
+        if not query:
+            labels = {**(context.get("labels") or {})}
+            for key in ("namespace", "pod", "service", "node"):
+                if context.get(key) and not labels.get(key):
+                    labels[key] = context[key]
+            selector = logql_selector(labels)
+            if not selector:
+                return None
+            query = f"{selector} {ERROR_LINE_FILTER}"
+
+        start = None
+        starts_at = _parse_timestamp(context.get("starts_at"))
+        if starts_at is not None:
+            # Include the lead-up to the alert, but never search more than a day.
+            start = max(starts_at - 15 * 60, time.time() - 24 * 3600)
+        return await self.query_logs(query, start=start, limit=limit)
 
     async def run_synthetic(
         self,
@@ -441,6 +543,57 @@ class ObservabilityTools:
             return resp.json()
         except Exception:
             return {"error": "Non-JSON response", "text": resp.text[:500]}
+
+
+MAX_LOG_LINE_CHARS = 2000
+ERROR_LINE_FILTER = '|~ "(?i)(error|exception|fatal|panic|fail|timeout|refused|oom)"'
+
+# Alert labels that usually exist as Loki stream labels, tried in this order.
+_SELECTOR_LABEL_SETS = (
+    ("namespace", "pod"),
+    ("namespace", "container"),
+    ("namespace", "app"),
+    ("job",),
+    ("app",),
+    ("service_name",),
+    ("service",),
+    ("host",),
+)
+
+
+def default_log_provider() -> Optional[str]:
+    """'grafana' or 'loki' when one is configured, else None."""
+    if os.getenv("GRAFANA_URL", "").strip() and os.getenv("GRAFANA_LOKI_DATASOURCE_UID", "").strip():
+        return "grafana"
+    if os.getenv("LOKI_URL", "").strip():
+        return "loki"
+    return None
+
+
+def logql_selector(labels: dict) -> Optional[str]:
+    """Build a LogQL stream selector such as {namespace="prod", pod="api-1"} from alert labels."""
+    for keys in _SELECTOR_LABEL_SETS:
+        values = [labels.get(key) for key in keys]
+        if all(isinstance(v, str) and v.strip() for v in values):
+            matchers = ", ".join(
+                f'{key}="{_escape_logql(value.strip())}"' for key, value in zip(keys, values)
+            )
+            return "{" + matchers + "}"
+    return None
+
+
+def _escape_logql(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", " ")
+
+
+def _parse_timestamp(value) -> Optional[float]:
+    """Unix seconds from an RFC 3339 alert timestamp (Alertmanager/Grafana startsAt)."""
+    if not isinstance(value, str) or not value or value.startswith("0001-"):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
 
 
 def _bearer(env_name: str) -> dict:

@@ -620,6 +620,24 @@ AGENT_TOOLS = [
         },
     },
     {
+        "name": "query_logs",
+        "description": (
+            "Search logs with LogQL in Loki, through Grafana (GRAFANA_LOKI_DATASOURCE_UID) "
+            "or directly (LOKI_URL). Read-only. Example: "
+            '{namespace="prod", app="api"} |~ "(?i)error". Returns newest lines first.'
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "LogQL query"},
+                "provider": {"type": "string", "enum": ["grafana", "loki"]},
+                "since_minutes": {"type": "integer", "description": "Look-back window, default 30, max 1440."},
+                "limit": {"type": "integer", "description": "Max lines, default 200, max 1000."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "run_synthetic",
         "description": "HTTP synthetic check: GET a URL and assert status/latency.",
         "input_schema": {
@@ -1229,6 +1247,15 @@ class DevOpsAgent:
         except Exception as exc:  # never block incident flow on scanner errors
             log.warning("security_scan_failed", error=str(exc))
 
+        # Alerts from Grafana/Alertmanager: attach recent error logs from Loki.
+        if context.get("source") in ("grafana", "alertmanager") or context.get("logql"):
+            try:
+                alert_logs = await self.observability.logs_for_alert(context)
+                if alert_logs is not None:
+                    enriched["alert_logs"] = alert_logs
+            except Exception as exc:  # logs are evidence, never a blocker
+                log.warning("alert_logs_failed", error=str(exc))
+
         try:
             if issue_type == "k8s" and context.get("namespace"):
                 enriched["k8s_data"] = await self.k8s_collector.collect(
@@ -1644,6 +1671,13 @@ class DevOpsAgent:
                     inputs["service"],
                     backend=inputs.get("backend") or "tempo",
                     limit=int(inputs.get("limit") or 5),
+                )
+            elif name == "query_logs":
+                return await self.observability.query_logs(
+                    inputs["query"],
+                    provider=inputs.get("provider"),
+                    since_minutes=int(inputs.get("since_minutes") or 30),
+                    limit=int(inputs.get("limit") or 200),
                 )
             elif name == "run_synthetic":
                 return await self.observability.run_synthetic(

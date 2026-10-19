@@ -33,6 +33,7 @@ EVIDENCE_TOOLS: Set[str] = {
     "evaluate_slo",
     "capacity_check",
     "query_traces",
+    "query_logs",
     "run_synthetic",
     "get_oncall_roster",
     "check_database_health",

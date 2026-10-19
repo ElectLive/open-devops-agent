@@ -716,7 +716,35 @@ receivers:
     webhook_configs:
       - url: 'http://devops-agent.devops-agent.svc.cluster.local:8000/webhook/alertmanager'
         send_resolved: true
+        # Required when WEBHOOK_SECRET is set (Alertmanager cannot HMAC-sign bodies)
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: '<WEBHOOK_SECRET>'
 ```
+
+#### Grafana Alerting (alerts + Loki logs)
+
+Full setup guide: [docs/GRAFANA_PROMETHEUS.md](docs/GRAFANA_PROMETHEUS.md).
+
+1. **Alerting → Contact points → New → Webhook**
+   - URL: `https://your-agent-domain.com/webhook/grafana`
+   - Optional settings → **Authorization Header**: scheme `Bearer`, credentials = `WEBHOOK_SECRET`
+2. Route the alerts you want handled to that contact point in your notification policy.
+3. To give the agent logs, set the Loki datasource and a Grafana service-account token (Viewer):
+
+```bash
+GRAFANA_URL=https://grafana.yourcompany.com
+GRAFANA_TOKEN=glsa_...
+GRAFANA_LOKI_DATASOURCE_UID=<uid of your Loki datasource>
+```
+
+Each firing alert becomes an incident. Before diagnosing, the agent pulls recent error lines from Loki
+(from 15 minutes before the alert fired), using the alert's `namespace`/`pod`, `job`, `app` or `service`
+labels as the stream selector. Add a `logql` annotation to an alert rule to choose the exact query. The
+agent can also call `query_logs` itself to widen the search, then remediates with the usual tools
+(rollback, restart, config PR, etc.) under the same `AUTO_APPLY` and approval rules. Plain Loki without
+Grafana works too: set `LOKI_URL` (and `LOKI_TOKEN` if needed).
 
 #### GitHub Actions
 

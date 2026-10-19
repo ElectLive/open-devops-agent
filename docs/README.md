@@ -85,7 +85,7 @@ Check the support matrix and find the configuration for your CI/CD or cloud plat
 
 [Check platform support](PLATFORM_SUPPORT.md){ .docs-card-link }
 
-[Platform configuration](MULTI_PLATFORM_GUIDE.md) · [Deployment examples](USE_CASES_GCP_GITLAB_AND_AWS_BAMBOO.md)
+[Platform configuration](MULTI_PLATFORM_GUIDE.md) · [Grafana and Prometheus](GRAFANA_PROMETHEUS.md) · [Deployment examples](USE_CASES_GCP_GITLAB_AND_AWS_BAMBOO.md)
 
 </div>
 
