@@ -5,10 +5,11 @@ Durable queue + cloud storage for audit, logs, checkpoints, and org docs.
 """
 import asyncio
 import inspect
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import structlog
 from dotenv import load_dotenv
@@ -357,6 +358,28 @@ async def delete_org_doc(org_id: str, doc_path: str):
     return {"status": "deleted", "org_id": org_id, "path": doc_path}
 
 
+def _parse_json_body(body: Union[bytes, str]) -> Dict[str, Any]:
+    """
+    Parse a webhook request body as a JSON object.
+
+    Args:
+        body: Raw request body
+
+    Returns:
+        The parsed JSON object
+
+    Raises:
+        HTTPException: 400 if the body is not valid JSON or not a JSON object
+    """
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="JSON object required")
+    return data
+
+
 @app.post("/webhook/github")
 async def github_webhook(
     request: Request,
@@ -369,7 +392,7 @@ async def github_webhook(
 
     _require_webhook_auth(body, x_hub_signature_256)
 
-    payload = __import__("json").loads(body)
+    payload = _parse_json_body(body)
 
     if x_github_event == "workflow_run":
         run = payload.get("workflow_run", {})
@@ -425,7 +448,7 @@ async def alertmanager_webhook(
     body = await request.body()
     _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature)
 
-    payload = __import__("json").loads(body)
+    payload = _parse_json_body(body)
     queued = []
 
     for alert in payload.get("alerts", []):
@@ -473,7 +496,7 @@ async def gitlab_webhook(
         signature=x_hub_signature_256 or x_webhook_signature,
         static_token=x_gitlab_token,
     )
-    payload = __import__("json").loads(body)
+    payload = _parse_json_body(body)
     event = (x_gitlab_event or payload.get("object_kind") or "").lower()
 
     if event in ("merge request hook", "merge_request"):
@@ -530,7 +553,7 @@ async def bitbucket_webhook(
     """Bitbucket Cloud pull-request events for code review."""
     body = await request.body()
     _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature)
-    payload = __import__("json").loads(body)
+    payload = _parse_json_body(body)
     event = (x_event_key or "").lower()
     if event.startswith("pullrequest:") or payload.get("pullrequest"):
         pr = payload.get("pullrequest") or {}
@@ -573,7 +596,7 @@ async def manual_trigger(
     body = await request.body()
     _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature)
 
-    context = __import__("json").loads(body)
+    context = _parse_json_body(body)
     if "type" not in context:
         raise HTTPException(status_code=400, detail="'type' field required")
 
