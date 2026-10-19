@@ -6,18 +6,23 @@ import base64
 import importlib
 import inspect
 import json
+import re
 import runpy
 import shlex
 import textwrap
 
 import pytest
+import httpx
 
 from agent.core import AGENT_TOOLS, DevOpsAgent
 from tools.disk_cleanup import DiskCleanup
 from tools.executor import SafeExecutor
 from tools.nginx_tools import NginxTools
+from tools.notify import SlackNotifier
 from tools.safety import MUTATING_AGENT_TOOLS
 from tools.security_updates import SecurityUpdates
+from services.org_context import org_credentials
+from storage.memory_storage import MemoryStorage
 
 HOST_TOOL_TYPES = {
     "disk_cleanup": DiskCleanup,
@@ -115,26 +120,36 @@ class RecordingRunner:
         self.calls = []
         self.allow_mutations = False
         self.forbid_all = False
+        self.fail_prefix = None
 
     async def __call__(self, command, host):
         self.calls.append((command, host))
-        read_only = (
-            command.startswith(
-                (
-                    "find ",
-                    "nginx -t",
-                    "systemctl is-active",
-                    "systemctl status",
-                    "journalctl -u",
-                    "certbot certificates",
-                )
+        read_only = command in {
+            "nginx -t",
+            "systemctl is-active nginx 2>/dev/null || true",
+            "systemctl status nginx --no-pager -l | tail -40",
+            "journalctl -u nginx -n 40 --no-pager",
+            "certbot certificates 2>/dev/null || echo 'certbot not available'",
+            "certbot renew --dry-run --non-interactive --agree-tos",
+            "unattended-upgrade --dry-run 2>/dev/null || apt-get -s upgrade",
+        } or bool(
+            re.fullmatch(
+                r"find /var/log -type f \\\( -name '\*\.gz' -o -name '\*\.xz' "
+                r"-o -name '\*\.bz2' -o -name '\*\.1' -o -name '\*\.old' "
+                r"-o -name '\*\.rotated' \\\) -mtime \+[1-9][0-9]* -print",
+                command,
             )
-            or "--dry-run" in command
         )
         assert not self.forbid_all, f"Command ran before operation approval: {command}"
         assert self.allow_mutations or read_only, f"Unapproved mutation: {command}"
         stdout = "/var/log/syslog.1.gz\n" if command.startswith("find ") else "active"
-        return {"success": True, "returncode": 0, "stdout": stdout, "stderr": ""}
+        ok = not self.fail_prefix or not command.startswith(self.fail_prefix)
+        return {
+            "success": ok,
+            "returncode": 0 if ok else 1,
+            "stdout": stdout,
+            "stderr": "",
+        }
 
 
 @pytest.fixture
@@ -145,6 +160,8 @@ def agent(monkeypatch):
     )
     monkeypatch.delenv("AGENT_EMERGENCY_STOP", raising=False)
     monkeypatch.delenv("AUTO_APPLY", raising=False)
+    storage = MemoryStorage()
+    monkeypatch.setattr("storage.factory.get_storage", lambda: storage)
     for key in ("CERTBOT_DNS_PLUGIN", "CERTBOT_WILDCARD_DOMAINS"):
         monkeypatch.delenv(key, raising=False)
     instance = DevOpsAgent.__new__(DevOpsAgent)
@@ -152,6 +169,47 @@ def agent(monkeypatch):
     for attr, tool_type in HOST_TOOL_TYPES.items():
         setattr(instance, attr, tool_type(runner=runner))
     return instance, runner
+
+
+@pytest.fixture
+def approval_executor(agent, monkeypatch, tmp_path, capsys):
+    """Keep SafeExecutor.run real; emulate only its subprocess exit boundary."""
+    _, runner = agent
+    for tool_type in HOST_TOOL_TYPES.values():
+        monkeypatch.setattr(
+            importlib.import_module(tool_type.__module__),
+            tool_type.__name__,
+            lambda cls=tool_type: cls(runner=runner),
+        )
+
+    async def approved_exec(command, host=None):
+        argv = shlex.split(command)
+        assert argv[:2] == ["python3", "-c"]
+        assert len(argv) == 3
+        assert host is None
+        script = tmp_path / "approved_operation.py"
+        script.write_text(argv[2])
+
+        def run_script():
+            try:
+                runpy.run_path(str(script), run_name="__main__")
+            except SystemExit as exc:
+                return exc.code if isinstance(exc.code, int) else 1
+            return 0
+
+        capsys.readouterr()
+        status = await asyncio.to_thread(run_script)
+        return {
+            "success": status == 0,
+            "returncode": status,
+            "stdout": capsys.readouterr().out,
+            "stderr": "",
+            "command": command,
+        }
+
+    executor = SafeExecutor()
+    monkeypatch.setattr(executor, "_exec", approved_exec)
+    return executor
 
 
 def tool_inputs(name):
@@ -232,9 +290,7 @@ async def test_auto_apply_allows_live_host_mutation(agent, monkeypatch, name):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("name", HOST_MUTATIONS)
-async def test_approval_replays_complete_host_operation(
-    agent, monkeypatch, tmp_path, capsys, name
-):
+async def test_approval_replays_complete_host_operation(agent, approval_executor, name):
     instance, runner = agent
     runner.forbid_all = True
     inputs = {**tool_inputs(name), "host": "203.0.113.14"}
@@ -250,32 +306,13 @@ async def test_approval_replays_complete_host_operation(
     assert runner.calls == [], approval
     assert approval.get("requires_approval") is True
 
-    # Execute the approved Python operation in-process, retaining real helper
-    # behavior while replacing only constructors' external command runners.
-    for tool_type in HOST_TOOL_TYPES.values():
-        monkeypatch.setattr(
-            importlib.import_module(tool_type.__module__),
-            tool_type.__name__,
-            lambda cls=tool_type: cls(runner=runner),
-        )
     runner.forbid_all = False
     runner.allow_mutations = True
-
-    async def approved_exec(command, host=None):
-        argv = shlex.split(command)
-        assert argv[:2] == ["python3", "-c"]
-        assert len(argv) == 3
-        script = tmp_path / "approved_operation.py"
-        script.write_text(argv[2])
-        await asyncio.to_thread(runpy.run_path, str(script))
-        return {"success": True}
-
-    executor = SafeExecutor()
-    monkeypatch.setattr(executor, "_exec", approved_exec)
-    result = await executor.run(approval["command"])
+    result = await approval_executor.run(approval["command"])
 
     assert result["success"] is True
-    operation_result = json.loads(capsys.readouterr().out)
+    assert result["returncode"] == 0
+    operation_result = json.loads(result["stdout"])
     assert operation_result.get("success", operation_result.get("applied")) is True
     assert runner.calls
     assert all(host == "203.0.113.14" for _, host in runner.calls)
@@ -325,3 +362,253 @@ async def test_emergency_stop_blocks_every_mutating_agent_tool(
     assert result.get("emergency_stop") is True, result
     assert result.get("requires_approval") is False
     assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_approved_nginx_rollback_signals_failure(agent, approval_executor):
+    """Adapted reviewer reproducer: restored config must still exit nonzero."""
+    instance, runner = agent
+    runner.forbid_all = True
+    approval = await instance.execute_tool(
+        "apply_nginx_config",
+        {
+            "file_path": "/etc/nginx/sites-enabled/app",
+            "new_content": "server { invalid_directive; }\n",
+            "host": "203.0.113.23",
+            "dry_run": True,
+        },
+    )
+    assert approval["requires_approval"] is True
+    assert runner.calls == []
+    assert (
+        base64.b64decode(approval["approval_payload"]).decode() == approval["command"]
+    )
+    runner.forbid_all = False
+    runner.allow_mutations = True
+    runner.fail_prefix = "nginx -t"
+
+    result = await approval_executor.run(approval["command"])
+
+    operation = json.loads(result["stdout"])
+    assert operation["success"] is False and operation["restored"] is True
+    commands = [command for command, host in runner.calls if host == "203.0.113.23"]
+    assert len(commands) == len(runner.calls) == 4
+    assert commands[0].startswith("cp ")
+    assert "write_bytes" in commands[1]
+    assert commands[2] == "nginx -t"
+    assert commands[3].startswith("test -f ") and "mv " in commands[3]
+    assert not any("systemctl reload" in command for command in commands)
+    assert result["returncode"] != 0, operation
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,arguments",
+    [
+        (
+            "apply_nginx_config",
+            {"file_path": "/opt/rejected.conf", "new_content": "server {}"},
+        ),
+        ("renew_certificates", {"dry_run": False, "domains": ["invalid domain"]}),
+    ],
+)
+async def test_approved_invalid_arguments_fail_without_commands(
+    agent, approval_executor, name, arguments
+):
+    instance, runner = agent
+    runner.forbid_all = True
+    approval = await instance.execute_tool(name, {**arguments, "host": "203.0.113.24"})
+    assert runner.calls == []
+    assert approval["requires_approval"] is True
+
+    result = await approval_executor.run(approval["command"])
+
+    assert json.loads(result["stdout"])["blocked"] is True
+    assert result["returncode"] != 0
+    assert result["success"] is False
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "name,fail_prefix,contract",
+    [
+        ("apply_security_updates", "unattended-upgrade", "success"),
+        ("install_log_cleanup_cron", "cat >", "applied"),
+    ],
+)
+async def test_approved_helper_command_failure_preserves_status(
+    agent, approval_executor, name, fail_prefix, contract
+):
+    instance, runner = agent
+    runner.forbid_all = True
+    approval = await instance.execute_tool(
+        name, {"dry_run": False, "host": "203.0.113.25"}
+    )
+    assert runner.calls == []
+    runner.forbid_all = False
+    runner.allow_mutations = True
+    runner.fail_prefix = fail_prefix
+
+    result = await approval_executor.run(approval["command"])
+
+    assert json.loads(result["stdout"])[contract] is False
+    assert result["returncode"] != 0
+    assert result["success"] is False
+
+
+@pytest.mark.asyncio
+async def test_approved_failure_notification_reports_failure(agent, approval_executor):
+    instance, runner = agent
+    runner.forbid_all = True
+    approval = await instance.execute_tool(
+        "apply_security_updates", {"dry_run": False, "host": "203.0.113.25"}
+    )
+    assert runner.calls == []
+    runner.forbid_all = False
+    runner.allow_mutations = True
+    runner.fail_prefix = "unattended-upgrade"
+    messages = []
+
+    class Notifier:
+        async def send_message(self, message):
+            messages.append(message)
+
+    instance.executor = approval_executor
+    instance.notifier = Notifier()
+    await instance.execute_approved_action("approval-test", approval["command"])
+
+    assert len(messages) == 1
+    assert "❌ Approved action failed" in messages[0]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["apply_nginx_config", "restart_nginx"])
+@pytest.mark.parametrize("comment_size", [2 * 1024, 32 * 1024])
+async def test_large_config_approval_fits_slack_and_preserves_exact_operation(
+    agent, approval_executor, monkeypatch, name, comment_size
+):
+    instance, runner = agent
+    runner.forbid_all = True
+    config = "# " + "x" * comment_size + "\nserver { listen 80; }\n"
+    if name == "apply_nginx_config":
+        inputs = {"file_path": "/etc/nginx/sites-enabled/app", "new_content": config}
+    else:
+        inputs = {
+            "config_path": "/etc/nginx/sites-enabled/app",
+            "config_content": config,
+            "reload_only": True,
+        }
+    inputs["host"] = "203.0.113.26"
+    approval = await instance.execute_tool(name, inputs, {"org_id": "approval-owner"})
+    assert approval["requires_approval"] is True
+    assert runner.calls == []
+    requests = []
+
+    def receive(request):
+        requests.append(json.loads(request.content))
+        return httpx.Response(200)
+
+    transport = httpx.MockTransport(receive)
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(
+        "tools.notify.httpx.AsyncClient",
+        lambda **kwargs: client_type(transport=transport, **kwargs),
+    )
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://slack.example/webhook")
+    with org_credentials("approval-owner"):
+        await SlackNotifier().send_approval_request(
+            "Apply reviewed nginx configuration",
+            approval["command"],
+            approval["approval_payload"],
+        )
+    buttons = [
+        element
+        for block in requests[0]["blocks"]
+        if block["type"] == "actions"
+        for element in block["elements"]
+        if element["action_id"] == "approve_action"
+    ]
+    assert len(buttons) == 1
+    assert len(buttons[0]["value"]) <= 2000
+    envelope = json.loads(buttons[0]["value"])
+    assert envelope["org_id"] == "approval-owner"
+    command = base64.b64decode(envelope["command"]).decode()
+    assert command == approval["command"]
+    # Later caller edits cannot alter what this approval authorizes.
+    inputs[next(key for key in inputs if key in {"new_content", "config_content"})] = (
+        "changed"
+    )
+    inputs["host"] = "203.0.113.99"
+    runner.forbid_all = False
+    runner.allow_mutations = True
+    with org_credentials("approval-owner"):
+        result = await approval_executor.run(command)
+
+    assert result["success"] is True
+    encoded_config = base64.b64encode(config.encode()).decode()
+    assert any(encoded_config in command for command, _ in runner.calls)
+    assert all(host == "203.0.113.26" for _, host in runner.calls)
+    assert runner.calls[-1][0] == "systemctl reload nginx"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "misuse", ["other-org", "other-host", "changed-reference", "missing-reference"]
+)
+async def test_retained_approval_rejects_rebinding(agent, approval_executor, misuse):
+    instance, runner = agent
+    runner.forbid_all = True
+    approval = await instance.execute_tool(
+        "restart_nginx", {"host": "203.0.113.27"}, {"org_id": "approval-owner"}
+    )
+    assert runner.calls == []
+    command = approval["command"]
+    if misuse == "changed-reference":
+        command = command.replace("203.0.113.27", "203.0.113.28")
+    elif misuse == "missing-reference":
+        command = "agent-approval:" + "0" * 32 + " (203.0.113.27)"
+    org = "different-org" if misuse == "other-org" else "approval-owner"
+    with org_credentials(org):
+        result = await approval_executor.run(
+            command, host="203.0.113.28" if misuse == "other-host" else None
+        )
+
+    assert result.get("blocked") is True, result
+    assert result.get("success") is False
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+async def test_emergency_stop_blocks_retained_approval_replay(
+    agent, approval_executor, monkeypatch
+):
+    instance, runner = agent
+    runner.forbid_all = True
+    approval = await instance.execute_tool("restart_nginx", {"host": "203.0.113.29"})
+    assert runner.calls == []
+    monkeypatch.setenv("AGENT_EMERGENCY_STOP", "true")
+
+    result = await approval_executor.run(approval["command"])
+
+    assert result["blocked"] is True
+    assert result["emergency_stop"] is True
+    assert runner.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "command",
+    [
+        "find /var/log -type f -delete",
+        "find /var/log -type f -exec rm {} ;",
+        "certbot renew --dry-run; systemctl restart nginx",
+        "nginx -t; systemctl restart nginx",
+        "unattended-upgrade --dry-run && systemctl restart nginx",
+    ],
+)
+async def test_recording_runner_rejects_mutating_read_only_lookalikes(command):
+    runner = RecordingRunner()
+    with pytest.raises(AssertionError, match="Unapproved mutation"):
+        await runner(command, "203.0.113.30")

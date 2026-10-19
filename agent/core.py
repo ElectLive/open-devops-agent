@@ -55,6 +55,7 @@ from tools.data_state import DataStateTools
 from tools.code_review import CodeReviewTools, detect_platform_from_url
 from collectors.database_policy import check_database_access
 from services.incident_store import IncidentStore
+from services.approval_store import CommandApprovalStore
 from services.org_docs import OrgDocs
 from services.org_context import org_agent_credentials
 from services.pii_scrubber import scrub_dict, scrub_text, scrub_value
@@ -1232,8 +1233,9 @@ class DevOpsAgent:
                     f"🛑 Emergency stop active — approved action blocked for `{incident_id}`:\n```{command}```"
                 )
                 return
+            status = "✅ Approved action executed" if result.get("success") else "❌ Approved action failed"
             await self.notifier.send_message(
-                f"✅ Approved action executed for `{incident_id}`:\n```{command}```\nResult: {result.get('stdout', '')}"
+                f"{status} for `{incident_id}`:\n```{command}```\nResult: {result.get('stdout', '')}"
             )
 
     async def _collect_context(self, context: dict) -> dict:
@@ -1824,16 +1826,21 @@ class DevOpsAgent:
     async def _execute_host_mutation(self, tool, method: str, **kwargs) -> dict:
         """Approve the whole host operation before any of its commands run."""
         if not self.auto_apply and not kwargs.get("dry_run", False):
-            # Slack approvals execute shell commands. Replay the entire helper,
-            # including validation and rollback, rather than a partial command.
+            # Replay the entire helper, including validation and rollback.
+            # Retain its arguments outside Slack's bounded button value.
             tool_type = type(tool)
             script = (
-                "import asyncio, json; "
+                "import asyncio, json, sys; "
                 f"from {tool_type.__module__} import {tool_type.__name__}; "
-                f"print(json.dumps(asyncio.run({tool_type.__name__}().{method}("
-                f"**json.loads({json.dumps(kwargs)!r})))))"
+                f"result = asyncio.run({tool_type.__name__}().{method}("
+                f"**json.loads({json.dumps(kwargs)!r}))); "
+                "print(json.dumps(result)); "
+                "sys.exit(0 if not (result.get('blocked') or result.get('error')) "
+                "and result.get('success', result.get('applied', False)) is True else 1)"
             )
-            command = f"python3 -c {shlex.quote(script)}"
+            command = CommandApprovalStore().retain(
+                f"python3 -c {shlex.quote(script)}", host=kwargs.get("host")
+            )
             return {
                 "blocked": True,
                 "requires_approval": True,

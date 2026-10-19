@@ -10,6 +10,7 @@ from typing import Optional
 
 import structlog
 
+from services.approval_store import APPROVAL_REFERENCE_PREFIX, CommandApprovalStore
 from tools.safety import (
     emergency_stop_block,
     is_emergency_stop_active,
@@ -107,6 +108,19 @@ class SafeExecutor:
             return emergency_stop_block(
                 "Agent emergency stop is active. Approved actions cannot run."
             )
+        if command.startswith(APPROVAL_REFERENCE_PREFIX):
+            # Resolve in the approving process so memory-backed storage works,
+            # too. The retained operation already binds its target host.
+            retained = None if host else CommandApprovalStore().resolve(command)
+            if retained is None:
+                return {
+                    "blocked": True,
+                    "success": False,
+                    "returncode": 1,
+                    "command": command,
+                    "message": "Approval reference is unavailable or does not match this organisation/target.",
+                }
+            command, host = retained, None
         return await self._exec(command, host)
 
     async def run_safe(self, command: str, host: Optional[str] = None) -> dict:
