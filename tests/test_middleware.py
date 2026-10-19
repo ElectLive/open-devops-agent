@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import shlex
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -25,6 +26,7 @@ def client(monkeypatch):
     monkeypatch.setenv("ORG_ID", "acme")
     monkeypatch.setenv("MIDDLEWARE_EXEC_ENABLED", "true")
     monkeypatch.delenv("MIDDLEWARE_DEFAULT_HOST", raising=False)
+    monkeypatch.delenv("MIDDLEWARE_EXEC_ALLOWLIST", raising=False)
     return TestClient(mw.app)
 
 
@@ -240,6 +242,8 @@ class TestExec:
         assert res.status_code == 403
 
     def test_allows_docker_ps(self, client):
+        proc_call = {}
+
         class FakeProc:
             returncode = 0
 
@@ -250,6 +254,8 @@ class TestExec:
                 return None
 
         async def fake_exec(*args, **kwargs):
+            proc_call["args"] = args
+            proc_call["cwd"] = kwargs.get("cwd")
             return FakeProc()
 
         with patch.object(mw.asyncio, "create_subprocess_exec", side_effect=fake_exec):
@@ -262,6 +268,7 @@ class TestExec:
         assert res.status_code == 200
         assert res.json()["success"] is True
         assert "CONTAINER" in res.json()["stdout"]
+        assert proc_call == {"args": ("docker", "ps"), "cwd": None}
 
     def test_exec_disabled(self, monkeypatch):
         monkeypatch.setenv("AGENT_BASE_URL", "https://agent.example.com")
