@@ -301,3 +301,106 @@ class TestWebhookEndpoints:
             headers={"X-Hub-Signature-256": sig},
         )
         assert response.status_code == 400
+
+
+class TestBitbucketWebhookSignature:
+    @pytest.fixture
+    def signed_request(self, monkeypatch):
+        from api.server import app
+
+        secret = os.urandom(32).hex()
+        monkeypatch.setenv("WEBHOOK_SECRET", secret)
+        body_bytes = b'{ "repository": {"slug": "example"} }\n'
+        signature = "sha256=" + hmac.new(
+            secret.encode(), body_bytes, hashlib.sha256
+        ).hexdigest()
+        return TestClient(app), body_bytes, signature
+
+    @pytest.mark.parametrize(
+        "header",
+        ["X-Hub-Signature", "X-Hub-Signature-256", "X-Webhook-Signature"],
+    )
+    def test_accepts_valid_signature(self, signed_request, header):
+        """The 200 assertion catches removal of each header's acceptance path."""
+        client, body_bytes, signature = signed_request
+        response = client.post(
+            "/webhook/bitbucket",
+            content=body_bytes,
+            headers={header: signature},
+        )
+        assert response.status_code == 200
+        assert response.json()["status"] == "ignored"
+
+    def test_rejects_missing_signature(self, signed_request):
+        """The 401 assertion catches acceptance when all signature headers are absent."""
+        client, body_bytes, _ = signed_request
+        response = client.post("/webhook/bitbucket", content=body_bytes)
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize(
+        "header",
+        ["X-Hub-Signature", "X-Hub-Signature-256", "X-Webhook-Signature"],
+    )
+    @pytest.mark.parametrize(
+        "case", ["empty", "wrong_digest", "missing_prefix", "unknown_algorithm", "non_hex"]
+    )
+    def test_rejects_invalid_signature(self, signed_request, header, case):
+        """The 401 assertion catches acceptance of each distinct invalid signature.
+
+        Cases pin present-but-empty separately from absent, a wrong hex digest,
+        a missing sha256= prefix, an unknown algorithm, and non-hex digest text.
+        """
+        client, body_bytes, signature = signed_request
+        digest = signature.removeprefix("sha256=")
+        wrong_digest = ("1" if digest[0] == "0" else "0") + digest[1:]
+        invalid = {
+            "empty": "",
+            "wrong_digest": "sha256=" + wrong_digest,
+            "missing_prefix": digest,
+            "unknown_algorithm": "sha1=" + digest,
+            "non_hex": "sha256=" + "z" * 64,
+        }[case]
+        response = client.post(
+            "/webhook/bitbucket", content=body_bytes, headers={header: invalid}
+        )
+        assert response.status_code == 401
+
+    @pytest.mark.parametrize(
+        "preferred, fallback",
+        [
+            ("X-Hub-Signature-256", "X-Webhook-Signature"),
+            ("X-Hub-Signature-256", "X-Hub-Signature"),
+            ("X-Webhook-Signature", "X-Hub-Signature"),
+        ],
+    )
+    def test_preserves_header_precedence(self, signed_request, preferred, fallback):
+        """The 200 then 401 assertions catch reversed precedence or retry on failure."""
+        client, body_bytes, signature = signed_request
+        for preferred_value, fallback_value, expected_status in [
+            (signature, WRONG_WEBHOOK_SIGNATURE, 200),
+            (WRONG_WEBHOOK_SIGNATURE, signature, 401),
+        ]:
+            response = client.post(
+                "/webhook/bitbucket",
+                content=body_bytes,
+                headers={preferred: preferred_value, fallback: fallback_value},
+            )
+            assert response.status_code == expected_status
+
+    @pytest.mark.parametrize(
+        "empty_header, fallback",
+        [
+            ("X-Hub-Signature-256", "X-Webhook-Signature"),
+            ("X-Hub-Signature-256", "X-Hub-Signature"),
+            ("X-Webhook-Signature", "X-Hub-Signature"),
+        ],
+    )
+    def test_empty_header_allows_fallback(self, signed_request, empty_header, fallback):
+        """The 200 assertion catches treating an empty header as a chosen signature."""
+        client, body_bytes, signature = signed_request
+        response = client.post(
+            "/webhook/bitbucket",
+            content=body_bytes,
+            headers={empty_header: "", fallback: signature},
+        )
+        assert response.status_code == 200
