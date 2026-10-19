@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
+from services.incident_queue import QUEUE_REVIEWS
 from services.pii_scrubber import scrub_dict, scrub_value
 from storage.base import StorageProvider
 from storage.factory import get_storage
@@ -81,15 +82,18 @@ class IncidentStore:
         return entries
 
     def apply_retention(self, org_id: str) -> int:
-        """Delete audit, log, checkpoint, and queue objects older than retention_days."""
+        """Expire aged objects while retaining review queue records for head dedupe."""
         if self.retention_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         month_cutoff = cutoff.replace(day=1)
         deleted = 0
+        review_prefix = self.storage.org_prefix(org_id, "queue", QUEUE_REVIEWS) + "/"
         for category in ("audit", "logs", "checkpoints", "queue"):
             prefix = self.storage.org_prefix(org_id, category)
             for key in self.storage.list_keys(prefix):
+                if key.startswith(review_prefix):
+                    continue
                 obj_date, month_granularity = _object_retention_date(self.storage, key, category)
                 if obj_date is None:
                     continue

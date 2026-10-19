@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, patch
@@ -18,6 +19,7 @@ from api.webhook_auth import (
     verify_webhook_request,
 )
 from services.incident_queue import IncidentQueue
+from services.incident_store import IncidentStore
 from storage.memory_storage import MemoryStorage
 from tools.executor import SafeExecutor
 from tools.safety import requires_configured_approval
@@ -313,7 +315,12 @@ def bitbucket_request(monkeypatch):
     signing_key = os.urandom(32)
     monkeypatch.setenv("WEBHOOK_SECRET", signing_key.hex())
 
-    def post(payload, event="pullrequest:created", org_id="tenant-ember"):
+    def post(
+        payload,
+        event="pullrequest:created",
+        org_id="tenant-ember",
+        raise_server_exceptions=True,
+    ):
         body = json.dumps(payload).encode()
         signature = "sha256=" + hmac.new(
             signing_key.hex().encode(), body, hashlib.sha256
@@ -321,7 +328,9 @@ def bitbucket_request(monkeypatch):
         headers = {"X-Hub-Signature-256": signature, "X-Org-ID": org_id}
         if event is not None:
             headers["X-Event-Key"] = event
-        return TestClient(app).post("/webhook/bitbucket", content=body, headers=headers)
+        return TestClient(app, raise_server_exceptions=raise_server_exceptions).post(
+            "/webhook/bitbucket", content=body, headers=headers
+        )
 
     return post
 
@@ -350,6 +359,21 @@ def review_queue(monkeypatch):
     queue = IncidentQueue(MemoryStorage())
     monkeypatch.setattr("api.server.incident_queue", queue)
     return queue
+
+
+class InterruptedQueueWrite(BaseException):
+    """Simulate a stop that bypasses normal exception cleanup."""
+
+
+@pytest.fixture
+def review_context():
+    return {
+        "type": "code_review",
+        "scm_platform": "bitbucket",
+        "repo": "workspace-cedar/repository-maple",
+        "change_id": "731",
+        "head_sha": "commit-juniper",
+    }
 
 
 class TestBitbucketReviewTriggers:
@@ -478,3 +502,216 @@ class TestBitbucketReviewTriggers:
         second = review_queue.enqueue("tenant-ember", {**context, "scm_platform": "gitlab"})
         assert first != second
         assert len(review_queue.storage.list_keys("tenant-ember/queue/")) == 2
+
+    @pytest.mark.parametrize("window", ["before_pending", "after_pending"])
+    def test_interrupted_review_write_recovers_real_work(
+        self,
+        monkeypatch,
+        bitbucket_request,
+        bitbucket_payload,
+        review_queue,
+        review_context,
+        window,
+    ):
+        storage = review_queue.storage
+        put = storage.put_json
+        put_if_absent = storage.put_json_if_absent
+
+        def interrupt(key, data, write):
+            if "/queue/" not in key:
+                return write(key, data)
+            if window == "before_pending":
+                raise InterruptedQueueWrite()
+            write(key, data)
+            raise RuntimeError("Queue write acknowledgement lost")
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json", lambda key, data: interrupt(key, data, put))
+            injection.setattr(
+                storage,
+                "put_json_if_absent",
+                lambda key, data: interrupt(key, data, put_if_absent),
+            )
+            if window == "before_pending":
+                with pytest.raises(InterruptedQueueWrite):
+                    review_queue.enqueue("tenant-ember", review_context)
+            else:
+                try:
+                    review_queue.enqueue("tenant-ember", review_context)
+                except RuntimeError:
+                    # A lost acknowledgement may surface even though data committed.
+                    pass
+
+        restarted = IncidentQueue(storage)
+        monkeypatch.setattr("api.server.incident_queue", restarted)
+        response = bitbucket_request(bitbucket_payload)
+        repeat = bitbucket_request(bitbucket_payload)
+        assert response.status_code == repeat.status_code == 200
+        keys = storage.list_keys("tenant-ember/queue/")
+        assert len(keys) == 1
+        entry = storage.get_json(keys[0])
+        assert entry["status"] == "pending"
+        assert (
+            entry["incident_id"]
+            == response.json()["incident_id"]
+            == repeat.json()["incident_id"]
+        )
+        monkeypatch.setenv("ORG_ID", "tenant-configured")
+        monkeypatch.delenv("ORG_IDS", raising=False)
+        assert "tenant-ember" in restarted.list_pending_org_ids()
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            claimed = list(
+                executor.map(lambda _: restarted.claim_next("tenant-ember"), range(8))
+            )
+        assert len([item for item in claimed if item is not None]) == 1
+        assert restarted.recover_stale_processing("tenant-ember") == 1
+        recovered = restarted.claim_next("tenant-ember")
+        assert recovered["incident_id"] == entry["incident_id"]
+        assert recovered["attempts"] == 2
+        restarted.mark_completed("tenant-ember", entry["incident_id"], {})
+        assert restarted.claim_next("tenant-ember") is None
+        assert "tenant-ember" not in restarted.list_pending_org_ids()
+
+        # Review history remains the dedupe record after ordinary queue retention.
+        expired = storage.get_json(keys[0])
+        expired["completed_at"] = "2020-01-01T00:00:00+00:00"
+        put(keys[0], expired)
+        ordinary_key = storage.queue_key("tenant-ember", "completed", "INC-expired")
+        put(ordinary_key, {"completed_at": "2020-01-01T00:00:00+00:00"})
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        assert IncidentStore(storage).apply_retention("tenant-ember") == 1
+        assert not storage.exists(ordinary_key)
+        repeat = bitbucket_request(bitbucket_payload)
+        assert repeat.status_code == 200
+        assert repeat.json()["incident_id"] == entry["incident_id"]
+        assert len(storage.list_keys("tenant-ember/queue/")) == 1
+
+        # Recover a worker stop on either side of the review's status update.
+        for persist_status in (False, True):
+            context = {**review_context, "head_sha": f"commit-claim-{persist_status}"}
+            incident_id = restarted.enqueue("tenant-ember", context)
+
+            def interrupt_status(key, data):
+                if data.get("status") == "processing":
+                    if persist_status:
+                        put(key, data)
+                    raise InterruptedQueueWrite()
+                return put(key, data)
+
+            with monkeypatch.context() as injection:
+                injection.setattr(storage, "put_json", interrupt_status)
+                with pytest.raises(InterruptedQueueWrite):
+                    restarted.claim_next("tenant-ember")
+            assert restarted.recover_stale_processing("tenant-ember") == 1
+            recovered = restarted.claim_next("tenant-ember")
+            assert recovered["incident_id"] == incident_id
+            assert recovered["attempts"] == 2
+            restarted.mark_failed("tenant-ember", incident_id, "review unavailable")
+            assert restarted.claim_next("tenant-ember") is None
+
+        # Incomplete and non-review contexts keep independent queue entries.
+        contexts = [
+            {key: value for key, value in review_context.items() if key != "type"}
+        ]
+        contexts.append({**review_context, "type": "server"})
+        for field in ("scm_platform", "repo", "change_id", "head_sha"):
+            contexts.append(
+                {key: value for key, value in review_context.items() if key != field}
+            )
+            contexts.append({**review_context, field: ""})
+        for index, context in enumerate(contexts):
+            first = restarted.enqueue("tenant-alder", context)
+            second = restarted.enqueue("tenant-alder", context)
+            assert first != second
+            assert len(storage.list_keys("tenant-alder/queue/pending/")) == (
+                index + 1
+            ) * 2
+
+    @pytest.mark.parametrize("acknowledge", ["before_rollback", "after_rollback"])
+    def test_concurrent_duplicates_survive_owner_write_failure(
+        self,
+        monkeypatch,
+        bitbucket_request,
+        bitbucket_payload,
+        review_queue,
+        acknowledge,
+    ):
+        storage = review_queue.storage
+        put = storage.put_json
+        put_if_absent = storage.put_json_if_absent
+        owner_waiting = threading.Event()
+        release_owner = threading.Event()
+        owner_finished = threading.Event()
+        duplicates_ready = threading.Barrier(8)
+        first_lock = threading.Lock()
+        first_write = True
+
+        def pending_write(key, data, write):
+            nonlocal first_write
+            with first_lock:
+                owner = first_write and "/queue/" in key
+                if owner:
+                    first_write = False
+            if owner:
+                owner_waiting.set()
+                assert release_owner.wait(10)
+                raise RuntimeError("Queue write failed before persistence")
+            return write(key, data)
+
+        def conditional_write(key, data):
+            result = pending_write(key, data, put_if_absent)
+            if owner_waiting.is_set():
+                duplicates_ready.wait(timeout=10)
+                if acknowledge == "after_rollback":
+                    assert owner_finished.wait(10)
+            return result
+
+        monkeypatch.setattr(storage, "put_json", lambda key, data: pending_write(key, data, put))
+        monkeypatch.setattr(storage, "put_json_if_absent", conditional_write)
+
+        def post_owner():
+            try:
+                return bitbucket_request(bitbucket_payload, raise_server_exceptions=False)
+            finally:
+                owner_finished.set()
+
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            owner = executor.submit(post_owner)
+            try:
+                assert owner_waiting.wait(10)
+                duplicates = [
+                    executor.submit(
+                        bitbucket_request,
+                        bitbucket_payload,
+                        "pullrequest:created",
+                        "tenant-ember",
+                        False,
+                    )
+                    for _ in range(7)
+                ]
+                duplicates_ready.wait(timeout=10)
+                if acknowledge == "before_rollback":
+                    responses = [future.result(timeout=10) for future in duplicates]
+            finally:
+                release_owner.set()
+            owner_response = owner.result(timeout=10)
+            assert owner_response.status_code == 200
+            if acknowledge == "after_rollback":
+                responses = [future.result(timeout=10) for future in duplicates]
+
+        responses.append(owner_response)
+        assert all(response.status_code == 200 for response in responses)
+        keys = storage.list_keys("tenant-ember/queue/")
+        assert len(keys) == 1
+        entry = storage.get_json(keys[0])
+        assert entry["status"] == "pending"
+        assert {response.json()["incident_id"] for response in responses} == {
+            entry["incident_id"]
+        }
+        monkeypatch.setattr(storage, "put_json", put)
+        monkeypatch.setattr(storage, "put_json_if_absent", put_if_absent)
+        repeat = bitbucket_request(bitbucket_payload)
+        assert repeat.status_code == 200
+        assert repeat.json()["incident_id"] == entry["incident_id"]
+        assert len(storage.list_keys("tenant-ember/queue/")) == 1
