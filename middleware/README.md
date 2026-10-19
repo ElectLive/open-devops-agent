@@ -46,7 +46,7 @@ docker run --env-file .env -p 8080:8080 devops-agent-middleware
 | `POST` | `/forward` or `/webhook` or `/webhook/{source}` | Forward JSON incident to central agent |
 | `POST` | `/exec` | Optional allowlisted local command (off by default) |
 
-Auth (if `MIDDLEWARE_AUTH_TOKEN` set):
+Auth (required by default via `MIDDLEWARE_AUTH_TOKEN`):
 
 ```http
 Authorization: Bearer <token>
@@ -93,9 +93,11 @@ See [`.env.example`](.env.example).
 |----------|----------|---------|
 | `AGENT_BASE_URL` | yes | Central agent base URL |
 | `AGENT_WEBHOOK_SECRET` | recommended | Same as agent `WEBHOOK_SECRET` |
-| `MIDDLEWARE_AUTH_TOKEN` | recommended | Protects this middleware |
+| `MIDDLEWARE_AUTH_TOKEN` | yes | Protects this middleware (required unless `MIDDLEWARE_ALLOW_UNAUTHENTICATED=true`) |
+| `MIDDLEWARE_ALLOW_UNAUTHENTICATED` | no | Set `true` to allow unauthenticated `/forward` when token unset (default `false`) |
+| `MIDDLEWARE_TRUST_CALLER_ORG_ID` | no | Set `true` or comma-separated allowlist to trust caller `X-Org-ID` (default `false`) |
 | `ORG_ID` | no | Default org on forwarded events |
-| `MIDDLEWARE_EXEC_ENABLED` | no | Enable `/exec` (default `false`) |
+| `MIDDLEWARE_EXEC_ENABLED` | no | Enable `/exec` (default `false`, requires `MIDDLEWARE_AUTH_TOKEN`) |
 
 ## Security
 
