@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import base64
 import os
+import posixpath
 import re
+import shlex
 from typing import Callable, Optional
 
 import structlog
@@ -20,6 +22,11 @@ log = structlog.get_logger()
 
 _NGINX_FILE_RE = re.compile(r"in\s+(/[^\s:]+):(\d+)")
 _ALLOWED_CONFIG_PREFIXES = ("/etc/nginx/",)
+_SAFE_PATH_RE = re.compile(r"^/etc/nginx/[A-Za-z0-9._/-]+$")
+_DOMAIN_LABEL_RE = r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+_DOMAIN_RE = re.compile(
+    rf"^(?:\*\.)?{_DOMAIN_LABEL_RE}(?:\.{_DOMAIN_LABEL_RE})*$"
+)
 _DNS_PLUGINS = {
     "cloudflare": ("--dns-cloudflare", "--dns-cloudflare-credentials"),
     "route53": ("--dns-route53", None),
@@ -54,7 +61,7 @@ class NginxTools:
         broken_file, broken_line = _nginx_error_location(stderr)
         file_content = None
         if broken_file:
-            read = await self._run(f"cat {broken_file}", host)
+            read = await self._run(f"cat {shlex.quote(broken_file)}", host)
             if read.get("success"):
                 file_content = read.get("stdout")
 
@@ -112,10 +119,12 @@ class NginxTools:
             }
 
         bak = f"{path}.agent-bak"
-        await self._run(f"cp {path} {bak} 2>/dev/null || true", host)
+        q_path = shlex.quote(path)
+        q_bak = shlex.quote(bak)
+        await self._run(f"cp {q_path} {q_bak} 2>/dev/null || true", host)
         write = await self._run(_write_file_command(path, new_content), host)
         if not write.get("success"):
-            await self._run(f"test -f {bak} && mv {bak} {path} || true", host)
+            await self._run(f"test -f {q_bak} && mv {q_bak} {q_path} || true", host)
             return {
                 "success": False,
                 "blocked": True,
@@ -126,7 +135,7 @@ class NginxTools:
 
         test = await self._run("nginx -t", host)
         if not test.get("success"):
-            await self._run(f"test -f {bak} && mv {bak} {path} || true", host)
+            await self._run(f"test -f {q_bak} && mv {q_bak} {q_path} || true", host)
             return {
                 "success": False,
                 "blocked": True,
@@ -209,6 +218,15 @@ class NginxTools:
     ) -> dict:
         if is_emergency_stop_active() and not dry_run:
             return emergency_stop_block("Agent emergency stop is active. Certificate renew is disabled.")
+        if domains is not None:
+            for d in domains:
+                if not isinstance(d, str) or not _is_valid_domain(d.strip()):
+                    return {
+                        "success": False,
+                        "blocked": True,
+                        "alerted": True,
+                        "message": f"Refusing to renew certificates — invalid domain {d!r}.",
+                    }
         probe = await self._run("certbot certificates 2>/dev/null || echo 'certbot not available'", host)
         text = probe.get("stdout") or ""
         if "certbot not available" in text:
@@ -278,9 +296,26 @@ class NginxTools:
 
 
 def _allowed_nginx_path(path: str) -> bool:
-    if not path.startswith("/") or ".." in path:
+    if not path or not isinstance(path, str):
         return False
-    return any(path.startswith(prefix) for prefix in _ALLOWED_CONFIG_PREFIXES)
+    if not _SAFE_PATH_RE.match(path):
+        return False
+    norm = posixpath.normpath(path)
+    if not any(norm.startswith(prefix) for prefix in _ALLOWED_CONFIG_PREFIXES):
+        return False
+    if len(norm) <= len("/etc/nginx/"):
+        return False
+    if ".." in path.split("/") or ".." in norm.split("/"):
+        return False
+    if path.endswith("/"):
+        return False
+    return True
+
+
+def _is_valid_domain(domain: str) -> bool:
+    if not domain or not isinstance(domain, str) or len(domain) > 253:
+        return False
+    return bool(_DOMAIN_RE.match(domain))
 
 
 def _nginx_error_location(text: str) -> tuple[Optional[str], Optional[int]]:
@@ -292,11 +327,13 @@ def _nginx_error_location(text: str) -> tuple[Optional[str], Optional[int]]:
 
 
 def _write_file_command(path: str, content: str) -> str:
-    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
-    return (
-        "python3 -c \"import base64,pathlib; "
-        f"pathlib.Path({path!r}).write_bytes(base64.b64decode({encoded!r}))\""
+    path_b64 = base64.b64encode(path.encode("utf-8")).decode("ascii")
+    content_b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    py_script = (
+        f'import base64,pathlib; '
+        f'pathlib.Path(base64.b64decode("{path_b64}").decode("utf-8")).write_bytes(base64.b64decode("{content_b64}"))'
     )
+    return f"python3 -c {shlex.quote(py_script)}"
 
 
 def _certbot_command(
@@ -305,7 +342,14 @@ def _certbot_command(
     plugin = os.getenv("CERTBOT_DNS_PLUGIN", "").strip().lower()
     creds = os.getenv("CERTBOT_DNS_CREDENTIALS", "").strip()
     env_domains = [d.strip() for d in os.getenv("CERTBOT_WILDCARD_DOMAINS", "").split(",") if d.strip()]
-    names = [d.strip() for d in (domains or []) if d] or env_domains
+    if domains is not None:
+        raw_names = [d.strip() if isinstance(d, str) else d for d in domains]
+    else:
+        raw_names = env_domains
+    for d in raw_names:
+        if not isinstance(d, str) or not _is_valid_domain(d):
+            return None, [f"Invalid domain name: {d!r}"]
+    names = raw_names
     notes = []
     dry = " --dry-run" if dry_run else ""
     extra = " --non-interactive --agree-tos"
@@ -315,13 +359,13 @@ def _certbot_command(
         if not flags:
             return None, [f"Unknown CERTBOT_DNS_PLUGIN={plugin!r}. Use: {', '.join(sorted(_DNS_PLUGINS))}"]
         plugin_flag, cred_flag = flags
-        cred_part = f" {cred_flag} {creds}" if cred_flag and creds else ""
+        cred_part = f" {cred_flag} {shlex.quote(creds)}" if cred_flag and creds else ""
         if cred_flag and not creds and plugin != "route53":
             return None, [
                 f"CERTBOT_DNS_PLUGIN={plugin} needs CERTBOT_DNS_CREDENTIALS (path to the DNS API file)."
             ]
         if names:
-            domain_flags = " ".join(f"-d {d}" for d in names)
+            domain_flags = " ".join(f"-d {shlex.quote(d)}" for d in names)
             notes.append(f"DNS-01 via certbot {plugin_flag} for {', '.join(names)}")
             return f"certbot certonly{extra}{dry} {plugin_flag}{cred_part} {domain_flags}", notes
         notes.append(f"DNS-01 plugin {plugin} configured; using certbot renew (existing lineages)")

@@ -5,7 +5,13 @@ import pytest
 
 from tools.cicd_tools import CICDTools, bump_patch_version
 from tools.github_tools import GitHubTools
-from tools.nginx_tools import NginxTools
+from tools.nginx_tools import (
+    NginxTools,
+    _allowed_nginx_path,
+    _certbot_command,
+    _is_valid_domain,
+    _write_file_command,
+)
 from tools.security_updates import SecurityUpdates
 
 
@@ -94,7 +100,7 @@ class TestNginxTools:
             dry_run=True, domains=["*.example.com", "example.com"]
         )
         assert result["success"] is True
-        assert any("--dns-cloudflare" in c and "-d *.example.com" in c for c in seen)
+        assert any("--dns-cloudflare" in c and "-d '*.example.com'" in c for c in seen)
 
     @pytest.mark.asyncio
     async def test_wildcard_without_plugin_or_domains_still_tries_renew(self, monkeypatch):
@@ -114,6 +120,153 @@ class TestNginxTools:
         result = await NginxTools(runner=runner).renew_certificates(dry_run=True)
         assert result["success"] is True
         assert any(c.startswith("certbot renew") for c in seen)
+
+    @pytest.mark.parametrize(
+        "bad_path",
+        [
+            "/etc/nginx/sites-enabled/app;rm -rf /",
+            "/etc/nginx/$(touch /tmp/pwned)",
+            "/etc/nginx/`whoami`.conf",
+            "/etc/nginx/my site.conf",
+            "/etc/nginx/conf.d/../../etc/passwd",
+            "/etc/nginx/../../etc/shadow",
+            "/etc/nginx/",
+            "/etc/nginx/conf.d/",
+            "/opt/evil.conf",
+            "/etc/nginx/test|touch /tmp/pwned",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_apply_nginx_config_rejects_dangerous_paths(self, bad_path):
+        runner = AsyncMock()
+        result = await NginxTools(runner=runner).apply_nginx_config(bad_path, "server {}")
+        assert result["success"] is False
+        assert result["blocked"] is True
+        assert "Refusing to write" in result["message"]
+        runner.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "bad_domain",
+        [
+            "example.com; rm -rf /",
+            "$(touch /tmp/evil)",
+            "`whoami`.example.com",
+            "example .com",
+            "foo bar.com",
+            "-d evil.com",
+            "--dry-run",
+            "*.example.*",
+            "*.*.example.com",
+            "*",
+            "*.",
+            "-example.com",
+            "example-.com",
+            "example..com",
+            "",
+            "   ",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_renew_certificates_rejects_dangerous_domains(self, bad_domain):
+        runner = AsyncMock()
+        result = await NginxTools(runner=runner).renew_certificates(
+            dry_run=True, domains=[bad_domain]
+        )
+        assert result["success"] is False
+        assert result["blocked"] is True
+        assert "Refusing to renew certificates" in result["message"]
+        runner.assert_not_called()
+
+    def test_allowed_nginx_path_valid(self):
+        assert _allowed_nginx_path("/etc/nginx/nginx.conf") is True
+        assert _allowed_nginx_path("/etc/nginx/sites-enabled/app") is True
+        assert _allowed_nginx_path("/etc/nginx/conf.d/api_v1.conf") is True
+        assert _allowed_nginx_path("/etc/nginx/conf.d/sub/app-prod.conf") is True
+
+    def test_allowed_nginx_path_invalid(self):
+        assert _allowed_nginx_path("") is False
+        assert _allowed_nginx_path(None) is False
+        assert _allowed_nginx_path("/etc/nginx/") is False
+        assert _allowed_nginx_path("/etc/nginx/..") is False
+        assert _allowed_nginx_path("/etc/nginx/../../etc/shadow") is False
+        assert _allowed_nginx_path("/etc/nginx/conf.d/../../etc/passwd") is False
+        assert _allowed_nginx_path("/etc/nginx/foo;bar") is False
+        assert _allowed_nginx_path("/etc/nginx/$(reboot)") is False
+        assert _allowed_nginx_path("/etc/nginx/`id`") is False
+        assert _allowed_nginx_path("/etc/nginx/foo bar.conf") is False
+        assert _allowed_nginx_path("/opt/evil.conf") is False
+
+    def test_is_valid_domain(self):
+        assert _is_valid_domain("example.com") is True
+        assert _is_valid_domain("*.example.com") is True
+        assert _is_valid_domain("sub.example.com") is True
+        assert _is_valid_domain("*.sub.example.com") is True
+        assert _is_valid_domain("my-domain.co.uk") is True
+        assert _is_valid_domain("localhost") is True
+
+        assert _is_valid_domain("") is False
+        assert _is_valid_domain(None) is False
+        assert _is_valid_domain("example.com; rm -rf /") is False
+        assert _is_valid_domain("$(reboot)") is False
+        assert _is_valid_domain("`whoami`") is False
+        assert _is_valid_domain("foo bar.com") is False
+        assert _is_valid_domain("-d evil.com") is False
+        assert _is_valid_domain("*") is False
+        assert _is_valid_domain("*.") is False
+        assert _is_valid_domain("example..com") is False
+
+    def test_write_file_command_prevents_shell_expansion(self, tmp_path):
+        import shlex
+        import subprocess
+
+        target_file = tmp_path / "test.conf"
+        marker_subst = tmp_path / "expanded_subst"
+        marker_backtick = tmp_path / "expanded_backtick"
+        danger_content = (
+            f"server {{ # $(touch {marker_subst})\n"
+            f" # `touch {marker_backtick}`\n ; echo evil\n }}"
+        )
+        cmd = _write_file_command(str(target_file), danger_content)
+
+        # The command is a single quoted python3 -c argument; content travels as base64.
+        argv = shlex.split(cmd)
+        assert argv[:2] == ["python3", "-c"]
+        assert len(argv) == 3
+        assert "$(" not in argv[2] and "`" not in argv[2]
+
+        # Run it through a real shell (as SafeExecutor does) without shell=True:
+        # nothing may be expanded and the content must be written verbatim.
+        subprocess.run(["sh", "-c", cmd], check=True)
+        assert target_file.read_text() == danger_content
+        assert not marker_subst.exists()
+        assert not marker_backtick.exists()
+
+    def test_certbot_command_quotes_domains_and_credentials(self, monkeypatch):
+        monkeypatch.setenv("CERTBOT_DNS_PLUGIN", "cloudflare")
+        monkeypatch.setenv("CERTBOT_DNS_CREDENTIALS", "/etc/secrets/my credentials.ini")
+
+        cmd, notes = _certbot_command(
+            dry_run=True,
+            domains=["*.example.com", "example.com"],
+            certificates_text="",
+        )
+        assert cmd is not None
+        assert "-d '*.example.com'" in cmd
+        assert "-d example.com" in cmd
+        assert "'/etc/secrets/my credentials.ini'" in cmd
+
+    def test_certbot_command_rejects_invalid_env_domains(self, monkeypatch):
+        monkeypatch.setenv("CERTBOT_DNS_PLUGIN", "cloudflare")
+        monkeypatch.setenv("CERTBOT_DNS_CREDENTIALS", "/etc/cf.ini")
+        monkeypatch.setenv("CERTBOT_WILDCARD_DOMAINS", "example.com; rm -rf /")
+
+        cmd, notes = _certbot_command(
+            dry_run=True,
+            domains=None,
+            certificates_text="",
+        )
+        assert cmd is None
+        assert any("Invalid domain name" in n for n in notes)
 
 
 class TestSecurityUpdates:
