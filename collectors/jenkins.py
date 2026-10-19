@@ -13,6 +13,9 @@ log = structlog.get_logger()
 
 class JenkinsCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.url = os.getenv("JENKINS_URL", "")
         self.username = os.getenv("JENKINS_USERNAME", "")
         self.token = os.getenv("JENKINS_API_TOKEN", "")

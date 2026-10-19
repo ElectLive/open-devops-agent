@@ -19,6 +19,9 @@ def _get_verify_ssl():
 
 class ArgoCDCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.server_url = os.getenv("ARGOCD_SERVER_URL", "")
         self.auth_token = os.getenv("ARGOCD_AUTH_TOKEN", "")
         self.headers = {

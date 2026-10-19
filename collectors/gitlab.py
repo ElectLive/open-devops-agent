@@ -13,6 +13,9 @@ log = structlog.get_logger()
 
 class GitLabCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.token = os.getenv("GITLAB_TOKEN", "")
         self.base_url = os.getenv("GITLAB_URL", "https://gitlab.com")
         self.headers = {

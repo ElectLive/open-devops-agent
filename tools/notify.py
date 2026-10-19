@@ -2,6 +2,7 @@
 Slack Notifier
 Sends rich incident summaries and interactive approval buttons to Slack.
 """
+import json
 import os
 from typing import Optional
 
@@ -9,6 +10,7 @@ import httpx
 import structlog
 
 from services.pii_scrubber import scrub_text
+from services.org_context import current_org_id
 
 log = structlog.get_logger()
 
@@ -71,7 +73,13 @@ class SlackNotifier:
                         "text": {"type": "plain_text", "text": "✅ Approve & Execute"},
                         "style": "primary",
                         "action_id": "approve_action",
-                        "value": f"PENDING:{encoded}",
+                        "value": json.dumps(
+                            {
+                                "org_id": current_org_id(),
+                                "incident_id": "PENDING",
+                                "command": encoded,
+                            }
+                        ),
                     },
                     {
                         "type": "button",

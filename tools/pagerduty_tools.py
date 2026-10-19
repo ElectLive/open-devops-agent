@@ -15,6 +15,9 @@ log = structlog.get_logger()
 
 class PagerDutyClient:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.enabled = os.getenv("PAGERDUTY_ENABLED", "false").lower() == "true"
         self.base_url = os.getenv("PAGERDUTY_URL", "https://api.pagerduty.com").rstrip(
             "/"

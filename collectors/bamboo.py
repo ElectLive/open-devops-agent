@@ -13,6 +13,9 @@ log = structlog.get_logger()
 
 class BambooCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.url = os.getenv("BAMBOO_URL", "")
         self.username = os.getenv("BAMBOO_USERNAME", "")
         self.password = os.getenv("BAMBOO_PASSWORD", "")

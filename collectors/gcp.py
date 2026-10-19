@@ -22,6 +22,9 @@ SUPPORTED_TYPES = [
 
 class GCPCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.project_id = os.getenv("GCP_PROJECT_ID", "")
 
     def list_supported_types(self) -> List[str]:

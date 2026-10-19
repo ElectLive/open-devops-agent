@@ -14,13 +14,16 @@ log = structlog.get_logger()
 
 class GitHubTools:
     def __init__(self):
+        self.base = "https://api.github.com"
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.token = os.getenv("GITHUB_TOKEN", "")
         self.headers = {
             "Authorization": f"Bearer {self.token}",
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
-        self.base = "https://api.github.com"
 
     async def create_fix_pr(
         self,

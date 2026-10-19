@@ -22,6 +22,9 @@ SUPPORTED_TYPES = [
 
 class AzureCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID", "")
 
     def list_supported_types(self) -> List[str]:

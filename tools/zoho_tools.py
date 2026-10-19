@@ -14,6 +14,9 @@ log = structlog.get_logger()
 
 class ZohoDeskClient:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.enabled = os.getenv("ZOHO_ENABLED", "false").lower() == "true"
         self.org_id = os.getenv("ZOHO_DESK_ORG_ID", "")
         self.access_token = os.getenv("ZOHO_ACCESS_TOKEN", "")

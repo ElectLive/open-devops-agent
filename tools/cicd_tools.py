@@ -16,6 +16,9 @@ class CICDTools:
     """Unified CI/CD tools for multiple platforms."""
     
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.gitlab_token = os.getenv("GITLAB_TOKEN", "")
         self.gitlab_url = os.getenv("GITLAB_URL", "https://gitlab.com")
         self.jenkins_url = os.getenv("JENKINS_URL", "")

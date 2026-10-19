@@ -13,6 +13,7 @@ from agent.core import AGENT_TOOLS, DevOpsAgent
 from services.incident_queue import IncidentQueue
 from services.incident_store import IncidentStore
 from services.org_config import OrgConfig
+from services.org_context import org_agent_credentials
 from services.org_docs import OrgDocs
 
 load_dotenv()
@@ -63,7 +64,8 @@ def _make_agent_tool_handler(
     async def handler(**kwargs: Any) -> dict:
         org_id = kwargs.pop("org_id", None) or os.getenv("ORG_ID", "default")
         context = {"org_id": org_id}
-        return await agent.execute_tool(tool_name, kwargs, context)
+        with org_agent_credentials(org_id, agent):
+            return await agent.execute_tool(tool_name, kwargs, context)
 
     handler.__name__ = tool_name
     sig = _build_signature(schema)
@@ -155,7 +157,8 @@ def register_platform_tools(
         payload.setdefault("source", "mcp")
         payload["org_id"] = org
         iid = incident_id or f"mcp-{org}"
-        result = await agent.run(payload, incident_id=iid, resume=False)
+        with org_agent_credentials(org, agent):
+            result = await agent.run(payload, incident_id=iid, resume=False)
         return result
 
     @mcp.tool(name="get_incident_audit", description="Fetch recent incident audit entries for an organization.")

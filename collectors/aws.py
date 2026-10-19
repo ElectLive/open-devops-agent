@@ -23,6 +23,9 @@ SUPPORTED_TYPES = [
 
 class AWSCollector:
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.region = os.getenv("AWS_REGION", "us-east-1")
 
     def list_supported_types(self) -> List[str]:

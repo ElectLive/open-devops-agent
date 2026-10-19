@@ -15,6 +15,9 @@ class CloudTools:
     """Unified cloud tools for AWS, GCP, and Azure."""
     
     def __init__(self):
+        self.refresh_credentials()
+
+    def refresh_credentials(self) -> None:
         self.aws_region = os.getenv("AWS_REGION", "us-east-1")
         self.gcp_project = os.getenv("GCP_PROJECT_ID", "")
         self.azure_subscription = os.getenv("AZURE_SUBSCRIPTION_ID", "")
