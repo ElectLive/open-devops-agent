@@ -27,7 +27,7 @@ flowchart TB
     worker --> notify["Notifications<br/>and escalation"]
 ```
 
-The queue and worker are part of the API service. Platform calls originate from collectors and tools; the diagram does not imply separate deployed services for every component. When several API processes are running, only the process that holds the background lock polls the queue and runs retention. A pending incident is claimed by creating its processing record only if that record is not already stored.
+The queue and worker are part of the API service. Platform calls originate from collectors and tools; the diagram does not imply separate deployed services for every component. When several API processes share a host and lock file, only the process that holds the background lock polls the queue and runs retention. The lock is per host; replicas on separate hosts can each run a queue loop. Correctness across hosts comes from the conditional claim: a pending incident is claimed by atomically creating its processing record only if that record is not already stored.
 
 ## Core Components
 
