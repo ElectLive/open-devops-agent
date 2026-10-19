@@ -715,3 +715,137 @@ class TestBitbucketReviewTriggers:
         assert repeat.status_code == 200
         assert repeat.json()["incident_id"] == entry["incident_id"]
         assert len(storage.list_keys("tenant-ember/queue/")) == 1
+
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    @pytest.mark.parametrize("held", ["pending_claim", "processing_recovery"])
+    def test_terminal_retention_compacts_payloads_and_preserves_fences(
+        self,
+        monkeypatch,
+        bitbucket_request,
+        bitbucket_payload,
+        review_queue,
+        review_context,
+        terminal,
+        held,
+    ):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = review_queue.storage
+        response = bitbucket_request(bitbucket_payload)
+        assert response.status_code == 200
+        incident_id = response.json()["incident_id"]
+        review_key = storage.list_keys("tenant-ember/queue/")[0]
+        if held == "processing_recovery":
+            assert review_queue.claim_next("tenant-ember")["incident_id"] == incident_id
+
+        get = storage.get_json
+        snapshot_taken = threading.Event()
+        release_snapshot = threading.Event()
+        expected_status = "pending" if held == "pending_claim" else "processing"
+
+        def hold_snapshot(key):
+            entry = get(key)
+            if (
+                key == review_key
+                and entry.get("status") == expected_status
+                and not snapshot_taken.is_set()
+            ):
+                snapshot_taken.set()
+                assert release_snapshot.wait(10)
+            return entry
+
+        monkeypatch.setattr(storage, "get_json", hold_snapshot)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            action = (
+                review_queue.claim_next
+                if held == "pending_claim"
+                else review_queue.recover_stale_processing
+            )
+            stale = executor.submit(action, "tenant-ember")
+            try:
+                assert snapshot_taken.wait(10)
+                if held == "pending_claim":
+                    assert review_queue.claim_next("tenant-ember")["incident_id"] == incident_id
+                if terminal == "completed":
+                    review_queue.mark_completed("tenant-ember", incident_id, {"resolved": True})
+                else:
+                    review_queue.mark_failed("tenant-ember", incident_id, "review unavailable")
+                claim_key = storage.list_keys("tenant-ember/review_claims/")[0]
+                store = IncidentStore(storage)
+                assert store.apply_retention("tenant-ember") == 0
+                assert get(review_key)["context"]["head_sha"] == "commit-juniper"
+                assert get(claim_key)["context"]["head_sha"] == "commit-juniper"
+
+                ended_field = "completed_at" if terminal == "completed" else "failed_at"
+                aged = get(review_key)
+                fresh_timestamp = aged[ended_field]
+                aged[ended_field] = "2020-01-01T00:00:00+00:00"
+                storage.put_json(review_key, aged)
+                expired_key = storage.queue_key("tenant-ember", "completed", "INC-expired")
+                fresh_key = storage.queue_key("tenant-ember", "completed", "INC-fresh")
+                storage.put_json(expired_key, {"completed_at": aged[ended_field]})
+                fresh = {"completed_at": fresh_timestamp, "context": {"type": "server"}}
+                storage.put_json(fresh_key, fresh)
+
+                assert store.apply_retention("tenant-ember") == 1
+                assert not storage.exists(expired_key)
+                assert get(fresh_key) == fresh
+                assert "context" not in get(review_key)
+                assert "context" not in get(claim_key)
+                expected = {
+                    "incident_id": incident_id,
+                    "org_id": "tenant-ember",
+                    "status": terminal,
+                    ended_field: "2020-01-01T00:00:00+00:00",
+                }
+                assert get(review_key) == expected
+                assert get(claim_key) == expected
+                assert store.apply_retention("tenant-ember") == 0
+            finally:
+                release_snapshot.set()
+            assert stale.result(timeout=10) == (None if held == "pending_claim" else 0)
+
+        restarted = IncidentQueue(storage)
+        monkeypatch.setattr("api.server.incident_queue", restarted)
+        for _ in range(2):
+            repeat = bitbucket_request(bitbucket_payload, "pullrequest:updated")
+            assert repeat.status_code == 200
+            assert repeat.json()["incident_id"] == incident_id
+            assert get(review_key) == expected
+        assert restarted.claim_next("tenant-ember") is None
+        assert restarted.recover_stale_processing("tenant-ember") == 0
+        assert get(claim_key) == expected
+        assert storage.list_keys("tenant-ember/queue/reviews/") == [review_key]
+
+        live_context = {**review_context, "head_sha": "commit-live-processing"}
+        processing_id = restarted.enqueue("tenant-ember", live_context)
+        assert restarted.claim_next("tenant-ember")["incident_id"] == processing_id
+        pending_id = restarted.enqueue(
+            "tenant-ember", {**review_context, "head_sha": "commit-live-pending"}
+        )
+        live_keys = [
+            key
+            for key in storage.list_keys("tenant-ember/queue/reviews/")
+            if key != review_key
+        ] + [
+            key
+            for key in storage.list_keys("tenant-ember/review_claims/")
+            if key != claim_key
+        ]
+        for key in live_keys:
+            entry = get(key)
+            entry["created_at"] = "2020-01-01T00:00:00+00:00"
+            if "claimed_at" in entry:
+                entry["claimed_at"] = "2020-01-01T00:00:00+00:00"
+            storage.put_json(key, entry)
+        before_retention = {key: get(key) for key in live_keys}
+        assert store.apply_retention("tenant-ember") == 0
+        assert {key: get(key) for key in live_keys} == before_retention
+        assert all("context" in get(key) for key in live_keys)
+        assert restarted.recover_stale_processing("tenant-ember") == 1
+        claimed = [restarted.claim_next("tenant-ember") for _ in range(2)]
+        assert {entry["incident_id"] for entry in claimed} == {processing_id, pending_id}
+        recovered = next(
+            entry for entry in claimed if entry["incident_id"] == processing_id
+        )
+        assert recovered["context"] == live_context
+        assert recovered["attempts"] == 2

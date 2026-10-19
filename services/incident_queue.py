@@ -126,7 +126,7 @@ class IncidentQueue:
                 continue
             claim_key = self._review_claim_key(org_id, entry["incident_id"])
             claim = self.storage.get_json(claim_key)
-            if not claim:
+            if not claim or claim.get("status") != QUEUE_PROCESSING:
                 continue
             # The claim can survive a stop before the queue's status update.
             entry = claim
