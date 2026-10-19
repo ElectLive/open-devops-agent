@@ -415,6 +415,12 @@ Only processes `workflow_run` events where `conclusion` is `failure`.
 
 Slack interactive button callback for approval workflow.
 
+Approval buttons retain the organisation that requested the action. Execution
+uses that organisation's credentials and restores the shared clients afterwards,
+including when execution fails or is cancelled. Buttons created before this
+organisation context was added must be requested again; callbacks without it
+return HTTP 400 instead of selecting an organisation implicitly.
+
 **Content-Type:** `application/x-www-form-urlencoded`
 
 **Headers:**

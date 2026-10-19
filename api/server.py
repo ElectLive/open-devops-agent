@@ -4,6 +4,8 @@ Receives events from GitHub, Alertmanager, and manual triggers.
 Durable queue + cloud storage for audit, logs, checkpoints, and org docs.
 """
 import asyncio
+import base64
+import binascii
 import inspect
 import json
 import os
@@ -30,7 +32,7 @@ from services.incident_store import IncidentStore
 from services.org_docs import OrgDocs
 from services.escalation import EscalationService, parse_queue_timestamp
 from services.org_config import OrgConfig
-from services.org_context import org_credentials, refresh_agent_credentials
+from services.org_context import org_agent_credentials
 from services.pii_scrubber import scrub_dict, scrub_text
 from tools.notify import SlackNotifier
 from tools.safety import is_emergency_stop_active
@@ -69,9 +71,7 @@ async def process_incident(entry: dict):
 
     log.info("Processing incident", id=incident_id, org_id=org_id)
 
-    with org_credentials(org_id):
-        refresh_agent_credentials(agent)
-        escalation_service.refresh_credentials()
+    with org_agent_credentials(org_id, agent, escalation_service):
         await _process_incident_with_org_creds(entry, incident_id, org_id, context, started_at)
 
 
@@ -614,10 +614,24 @@ async def slack_action(
     value = action.get("value", "")
 
     if action_id == "approve_action":
-        incident_id, encoded_cmd = value.split(":", 1)
-        import base64
-        cmd = base64.b64decode(encoded_cmd).decode()
-        background_tasks.add_task(agent.execute_approved_action, incident_id, cmd)
+        try:
+            approval = json.loads(value)
+            org_id = approval["org_id"]
+            incident_id = approval["incident_id"]
+            if not all(
+                isinstance(item, str) and item.strip() for item in (org_id, incident_id)
+            ):
+                raise ValueError("Missing approval organisation or incident")
+            cmd = base64.b64decode(approval["command"], validate=True).decode()
+            if not cmd.strip():
+                raise ValueError("Missing approval command")
+        except (ValueError, TypeError, KeyError, binascii.Error):
+            # Old buttons do not identify the org. Never guess a tenant for them.
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid approval; request a new approval with organisation context",
+            ) from None
+        background_tasks.add_task(agent.execute_approved_action, incident_id, cmd, org_id=org_id)
         return JSONResponse({"text": f"✅ Approved. Executing: `{cmd}`"})
 
     elif action_id == "reject_action":

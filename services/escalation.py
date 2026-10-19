@@ -48,22 +48,12 @@ class EscalationDecision:
 
 class EscalationService:
     def __init__(self):
-        self.enabled = os.getenv("ESCALATION_ENABLED", "true").lower() == "true"
-        self.timeout_minutes = int(os.getenv("ESCALATION_TIMEOUT_MINUTES", "10"))
-        self.channels = [
-            c.strip().lower()
-            for c in os.getenv("ESCALATION_CHANNELS", "slack,email").split(",")
-            if c.strip()
-        ]
-        self.on_db = os.getenv("ESCALATION_ON_DB_ISSUES", "true").lower() == "true"
-        self.on_unresolved = os.getenv("ESCALATION_ON_UNRESOLVED", "true").lower() == "true"
-        self.on_ai_failure = os.getenv("ESCALATION_ON_AI_FAILURE", "true").lower() == "true"
-
         self.slack = SlackNotifier()
         self.email = EmailNotifier()
         self.jira = JiraClient()
         self.zoho = ZohoDeskClient()
         self.pagerduty = PagerDutyClient()
+        self.refresh_credentials()
 
     def refresh_credentials(self) -> None:
         """Re-read escalation clients after an org credential overlay."""

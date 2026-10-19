@@ -54,7 +54,7 @@ from tools.code_review import CodeReviewTools, detect_platform_from_url
 from collectors.database_policy import check_database_access
 from services.incident_store import IncidentStore
 from services.org_docs import OrgDocs
-from services.org_context import org_credentials, refresh_agent_credentials
+from services.org_context import org_agent_credentials
 from services.pii_scrubber import scrub_dict, scrub_text, scrub_value
 
 log = structlog.get_logger()
@@ -992,8 +992,7 @@ class DevOpsAgent:
         )
         issue_type = context.get("type", "server")
 
-        with org_credentials(org_id):
-            refresh_agent_credentials(self)
+        with org_agent_credentials(org_id, self):
             self.auto_apply = os.getenv("AUTO_APPLY", "false").lower() == "true"
             self.model = os.getenv("CLAUDE_MODEL", self.model)
             return await self._run_with_org_context(
@@ -1200,18 +1199,22 @@ class DevOpsAgent:
                     raise
         raise last_error  # type: ignore[misc]
 
-    async def execute_approved_action(self, incident_id: str, command: str):
+    async def execute_approved_action(
+        self, incident_id: str, command: str, org_id: Optional[str] = None
+    ):
         """Execute a command that was approved via Slack."""
-        log.info("Executing approved action", incident_id=incident_id, command=command)
-        result = await self.executor.run(command)
-        if result.get("emergency_stop"):
+        org_id = org_id or os.getenv("ORG_ID", "default")
+        with org_agent_credentials(org_id, self):
+            log.info("Executing approved action", incident_id=incident_id, command=command)
+            result = await self.executor.run(command)
+            if result.get("emergency_stop"):
+                await self.notifier.send_message(
+                    f"🛑 Emergency stop active — approved action blocked for `{incident_id}`:\n```{command}```"
+                )
+                return
             await self.notifier.send_message(
-                f"🛑 Emergency stop active — approved action blocked for `{incident_id}`:\n```{command}```"
+                f"✅ Approved action executed for `{incident_id}`:\n```{command}```\nResult: {result.get('stdout', '')}"
             )
-            return
-        await self.notifier.send_message(
-            f"✅ Approved action executed for `{incident_id}`:\n```{command}```\nResult: {result.get('stdout', '')}"
-        )
 
     async def _collect_context(self, context: dict) -> dict:
         """Enrich the incident context with collected data."""
@@ -1366,8 +1369,7 @@ class DevOpsAgent:
         """Public entry point for tool execution (used by MCP and external agents)."""
         ctx = context or {}
         org_id = ctx.get("org_id") or os.getenv("ORG_ID", "default")
-        with org_credentials(org_id):
-            refresh_agent_credentials(self)
+        with org_agent_credentials(org_id, self):
             self.auto_apply = os.getenv("AUTO_APPLY", "false").lower() == "true"
             return await self._execute_tool(name, inputs, ctx)
 
