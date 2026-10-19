@@ -554,7 +554,7 @@ async def gitlab_webhook(
     if event in ("merge request hook", "merge_request"):
         attrs = payload.get("object_attributes") or {}
         action = (attrs.get("action") or "").lower()
-        if action in ("open", "reopen", "update", "approved") or attrs.get("state") == "opened":
+        if action in ("open", "reopen") or (action == "update" and "oldrev" in attrs):
             if attrs.get("work_in_progress") or attrs.get("draft"):
                 return {"status": "ignored", "reason": "draft_mr"}
             project = payload.get("project") or {}
@@ -571,6 +571,7 @@ async def gitlab_webhook(
                 "html_url": attrs.get("url"),
                 "base_ref": attrs.get("target_branch"),
                 "head_ref": attrs.get("source_branch"),
+                "head_sha": (attrs.get("last_commit") or {}).get("id"),
                 "labels": {"merge_request": "true", "code_review": "true"},
             }
             incident_id = await enqueue_incident(context)

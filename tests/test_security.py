@@ -8,6 +8,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -374,6 +375,334 @@ def review_context():
         "change_id": "731",
         "head_sha": "commit-juniper",
     }
+
+
+@pytest.fixture
+def gitlab_request(monkeypatch):
+    from api.server import app
+
+    signing_key = os.urandom(32).hex()
+    monkeypatch.setenv("WEBHOOK_SECRET", signing_key)
+
+    def post(payload, event="Merge Request Hook", org_id="tenant-ash", static_token=False):
+        body = json.dumps(payload).encode()
+        headers = {"X-Org-ID": org_id}
+        if event is not None:
+            headers["X-Gitlab-Event"] = event
+        if static_token:
+            headers["X-Gitlab-Token"] = signing_key
+        else:
+            headers["X-Hub-Signature-256"] = "sha256=" + hmac.new(
+                signing_key.encode(), body, hashlib.sha256
+            ).hexdigest()
+        return TestClient(app).post("/webhook/gitlab", content=body, headers=headers)
+
+    return post
+
+
+@pytest.fixture
+def gitlab_payload():
+    return {
+        "object_kind": "merge_request",
+        "project": {"id": 482, "path_with_namespace": "group-oak/repository-pine"},
+        "user": {"username": "reviewer"},
+        "object_attributes": {
+            "iid": 953,
+            "action": "open",
+            "state": "opened",
+            "title": "Review the merge request",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "last_commit": {"id": "commit-willow"},
+        },
+    }
+
+
+class TestGitlabReviewTriggers:
+    @pytest.mark.parametrize("action", ["update", "approved", "close", "merge", ""])
+    def test_ignores_actions_without_new_review_work(
+        self, gitlab_request, gitlab_payload, action
+    ):
+        gitlab_payload["object_attributes"]["action"] = action
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            response = gitlab_request(gitlab_payload)
+            assert response.status_code == 200
+            assert response.json()["status"] == "ignored"
+            assert enqueue.call_count == 0
+
+            gitlab_payload["object_attributes"]["action"] = "open"
+            positive = gitlab_request(gitlab_payload)
+            assert positive.status_code == 200
+            assert positive.json()["status"] == "queued"
+            assert enqueue.call_count == 1
+
+    @pytest.mark.parametrize("action", ["open", "reopen", "update"])
+    @pytest.mark.parametrize("event", ["Merge Request Hook", None])
+    def test_ready_actions_record_head_and_preserve_draft_guards(
+        self, gitlab_request, gitlab_payload, action, event
+    ):
+        attrs = gitlab_payload["object_attributes"]
+        attrs["action"] = action
+        if action == "update":
+            attrs["oldrev"] = "commit-previous"
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            for field in ("draft", "work_in_progress"):
+                draft = deepcopy(gitlab_payload)
+                draft["object_attributes"][field] = True
+                response = gitlab_request(draft, event)
+                assert response.status_code == 200
+                assert response.json()["status"] == "ignored"
+                assert enqueue.call_count == 0
+
+            response = gitlab_request(gitlab_payload, event)
+            assert response.status_code == 200
+            assert response.json() == {
+                "status": "queued",
+                "type": "code_review",
+                "incident_id": "INC-review",
+            }
+            assert enqueue.call_count == 1
+            context = enqueue.call_args.args[0]
+            assert context.get("head_sha") == "commit-willow"
+            assert context["type"] == "code_review"
+            assert context["scm_platform"] == "gitlab"
+            assert context["repo"] == "482"
+            assert context["change_id"] == "953"
+
+    @pytest.mark.parametrize("state", ["pending", "processing", "completed", "failed"])
+    def test_duplicate_head_returns_original_response_across_states(
+        self, gitlab_request, gitlab_payload, review_queue, state
+    ):
+        first = gitlab_request(gitlab_payload)
+        assert first.status_code == 200
+        incident_id = first.json()["incident_id"]
+        if state != "pending":
+            assert review_queue.claim_next("tenant-ash")["incident_id"] == incident_id
+        if state == "completed":
+            review_queue.mark_completed("tenant-ash", incident_id, {})
+        elif state == "failed":
+            review_queue.mark_failed("tenant-ash", incident_id, "review unavailable")
+        gitlab_payload["object_attributes"].update(
+            action="update", oldrev="commit-before", title="Edited title"
+        )
+        repeat = gitlab_request(gitlab_payload)
+        assert repeat.status_code == 200
+        assert repeat.json() == {
+            "status": "queued",
+            "type": "code_review",
+            "incident_id": incident_id,
+        }
+        keys = review_queue.storage.list_keys("tenant-ash/queue/")
+        assert len(keys) == 1
+        entry = review_queue.storage.get_json(keys[0])
+        assert entry["status"] == state
+        assert entry["context"].get("head_sha") == "commit-willow"
+
+    @pytest.mark.parametrize("field", ["org_id", "head_sha", "repo", "change_id"])
+    def test_distinct_identity_creates_new_review(
+        self, gitlab_request, gitlab_payload, review_queue, field
+    ):
+        first = gitlab_request(gitlab_payload)
+        repeat = gitlab_request(gitlab_payload)
+        assert first.status_code == repeat.status_code == 200
+        assert repeat.json() == first.json()
+        gitlab_payload["object_attributes"].update(action="update", oldrev="commit-before")
+        org_id = "tenant-ash"
+        if field == "org_id":
+            org_id = "tenant-elm"
+        elif field == "head_sha":
+            gitlab_payload["object_attributes"]["last_commit"]["id"] = "commit-poplar"
+        elif field == "repo":
+            gitlab_payload["project"]["id"] = 674
+        else:
+            gitlab_payload["object_attributes"]["iid"] = 816
+        second = gitlab_request(gitlab_payload, org_id=org_id)
+        second_repeat = gitlab_request(gitlab_payload, org_id=org_id)
+        assert second.status_code == second_repeat.status_code == 200
+        assert second.json() == second_repeat.json()
+        assert second.json()["incident_id"] != first.json()["incident_id"]
+        keys = [key for key in review_queue.storage.list_keys("") if "/queue/" in key]
+        assert len(keys) == 2
+        assert {review_queue.storage.get_json(key)["org_id"] for key in keys} == {
+            "tenant-ash",
+            org_id,
+        }
+
+    @pytest.mark.parametrize("delimiter", [":", '\",\"'])
+    def test_identity_field_boundaries_do_not_collide(
+        self, gitlab_request, gitlab_payload, review_queue, delimiter
+    ):
+        del gitlab_payload["project"]["id"]
+        gitlab_payload["project"]["path_with_namespace"] = f"group-oak{delimiter}842"
+        first = gitlab_request(gitlab_payload)
+        repeat = gitlab_request(gitlab_payload)
+        assert first.status_code == repeat.status_code == 200
+        assert repeat.json() == first.json()
+        # Moving a delimiter across adjacent fields must form a different identity.
+        gitlab_payload["project"]["path_with_namespace"] = "group-oak"
+        gitlab_payload["object_attributes"]["iid"] = f"842{delimiter}953"
+        second = gitlab_request(gitlab_payload)
+        second_repeat = gitlab_request(gitlab_payload)
+        assert second.status_code == second_repeat.status_code == 200
+        assert second_repeat.json() == second.json()
+        assert second.json()["incident_id"] != first.json()["incident_id"]
+        assert len(review_queue.storage.list_keys("tenant-ash/queue/")) == 2
+
+    @pytest.mark.parametrize("committed", [False, True])
+    def test_write_error_succeeds_only_when_record_persisted(
+        self, monkeypatch, gitlab_request, gitlab_payload, review_queue, committed
+    ):
+        storage = review_queue.storage
+        put = storage.put_json_if_absent
+
+        def lose_acknowledgement(key, data):
+            if committed:
+                put(key, data)
+            raise RuntimeError("Review write unavailable")
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", lose_acknowledgement)
+            if committed:
+                response = gitlab_request(gitlab_payload)
+                assert response.status_code == 200
+                keys = storage.list_keys("tenant-ash/queue/")
+                assert len(keys) == 1
+                entry = storage.get_json(keys[0])
+                assert entry["context"].get("head_sha") == "commit-willow"
+                assert response.json() == {
+                    "status": "queued",
+                    "type": "code_review",
+                    "incident_id": entry["incident_id"],
+                }
+            else:
+                failure = None
+                try:
+                    gitlab_request(gitlab_payload)
+                except RuntimeError as error:
+                    failure = error
+                assert failure is not None
+                assert str(failure) == "Review write unavailable"
+                assert storage.list_keys("tenant-ash/queue/") == []
+
+        retry = gitlab_request(gitlab_payload)
+        assert retry.status_code == 200
+        keys = storage.list_keys("tenant-ash/queue/")
+        assert len(keys) == 1
+        assert retry.json()["incident_id"] == storage.get_json(keys[0])["incident_id"]
+        if committed:
+            assert retry.json() == response.json()
+
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    def test_interrupted_compaction_resumes_without_admitting_stale_claim(
+        self, monkeypatch, gitlab_request, gitlab_payload, review_queue, terminal
+    ):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = review_queue.storage
+        first = gitlab_request(gitlab_payload)
+        assert first.status_code == 200
+        incident_id = first.json()["incident_id"]
+        review_key = storage.list_keys("tenant-ash/queue/")[0]
+        assert storage.get_json(review_key)["context"].get("head_sha") == "commit-willow"
+        get, put = storage.get_json, storage.put_json
+        snapshot_taken = threading.Event()
+        release_snapshot = threading.Event()
+
+        def hold_pending(key):
+            entry = get(key)
+            if (
+                key == review_key
+                and entry.get("status") == "pending"
+                and not snapshot_taken.is_set()
+            ):
+                snapshot_taken.set()
+                assert release_snapshot.wait(10)
+            return entry
+
+        monkeypatch.setattr(storage, "get_json", hold_pending)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            stale = executor.submit(review_queue.claim_next, "tenant-ash")
+            try:
+                assert snapshot_taken.wait(10)
+                assert review_queue.claim_next("tenant-ash")["incident_id"] == incident_id
+                if terminal == "completed":
+                    review_queue.mark_completed("tenant-ash", incident_id, {})
+                else:
+                    review_queue.mark_failed("tenant-ash", incident_id, "review unavailable")
+                ended_field = "completed_at" if terminal == "completed" else "failed_at"
+                aged = get(review_key)
+                aged[ended_field] = "2020-01-01T00:00:00+00:00"
+                put(review_key, aged)
+                claim_key = storage.list_keys("tenant-ash/review_claims/")[0]
+                minimal = {
+                    "incident_id": incident_id,
+                    "org_id": "tenant-ash",
+                    "status": terminal,
+                    ended_field: "2020-01-01T00:00:00+00:00",
+                }
+
+                def interrupt_canonical_write(key, data):
+                    if key == review_key:
+                        assert get(claim_key) == minimal
+                        raise InterruptedQueueWrite()
+                    return put(key, data)
+
+                with monkeypatch.context() as injection:
+                    injection.setattr(storage, "put_json", interrupt_canonical_write)
+                    with pytest.raises(InterruptedQueueWrite):
+                        IncidentStore(storage).apply_retention("tenant-ash")
+                assert get(claim_key) == minimal
+                assert get(review_key) == aged
+                repeat = gitlab_request(gitlab_payload)
+                assert repeat.status_code == 200
+                assert repeat.json() == first.json()
+                assert IncidentStore(storage).apply_retention("tenant-ash") == 0
+                assert get(review_key) == get(claim_key) == minimal
+                assert IncidentStore(storage).apply_retention("tenant-ash") == 0
+            finally:
+                release_snapshot.set()
+            assert stale.result(timeout=10) is None
+        restarted = IncidentQueue(storage)
+        monkeypatch.setattr("api.server.incident_queue", restarted)
+        assert restarted.claim_next("tenant-ash") is None
+        assert restarted.recover_stale_processing("tenant-ash") == 0
+        repeat = gitlab_request(gitlab_payload)
+        assert repeat.status_code == 200
+        assert repeat.json() == first.json()
+        assert storage.list_keys("tenant-ash/queue/") == [review_key]
+        assert get(review_key) == get(claim_key) == minimal
+
+    def test_static_token_review_and_failed_pipeline(
+        self, gitlab_request, gitlab_payload, review_queue
+    ):
+        review = gitlab_request(gitlab_payload, static_token=True)
+        assert review.status_code == 200
+        keys = review_queue.storage.list_keys("tenant-ash/queue/")
+        assert len(keys) == 1
+        entry = review_queue.storage.get_json(keys[0])
+        assert entry["context"].get("head_sha") == "commit-willow"
+        pipeline = {
+            "object_kind": "pipeline",
+            "project": {"id": 482},
+            "object_attributes": {"id": 617, "status": "failed"},
+        }
+        response = gitlab_request(pipeline, event=None)
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        assert response.json()["type"] == "cicd"
+        keys = review_queue.storage.list_keys("tenant-ash/queue/pending/")
+        assert len(keys) == 1
+        assert review_queue.storage.get_json(keys[0])["context"] == {
+            "type": "cicd",
+            "source": "gitlab_ci",
+            "org_id": "tenant-ash",
+            "project_id": "482",
+            "pipeline_id": 617,
+            "labels": {"cicd_platform": "gitlab"},
+        }
 
 
 class TestBitbucketReviewTriggers:
