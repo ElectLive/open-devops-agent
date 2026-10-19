@@ -725,6 +725,8 @@ receivers:
 
 #### Grafana Alerting (alerts + Loki logs)
 
+Full setup guide: [docs/GRAFANA_PROMETHEUS.md](docs/GRAFANA_PROMETHEUS.md).
+
 1. **Alerting → Contact points → New → Webhook**
    - URL: `https://your-agent-domain.com/webhook/grafana`
    - Optional settings → **Authorization Header**: scheme `Bearer`, credentials = `WEBHOOK_SECRET`
