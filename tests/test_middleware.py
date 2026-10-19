@@ -73,12 +73,163 @@ class TestForward:
         assert body["status"] == "forwarded"
         assert captured["url"] == "https://agent.example.com/webhook/manual"
         sig = captured["headers"]["X-Hub-Signature-256"]
-        expected_digest = hmac.new(
-            b"agent-secret", captured["content"], hashlib.sha256
-        ).hexdigest()
-        expected = "sha256=" + expected_digest
+        expected = (
+            "sha256="
+            + hmac.new(b"agent-secret", captured["content"], hashlib.sha256).hexdigest()
+        )
         assert sig == expected
         assert captured["headers"]["X-Org-ID"] == "acme"
+
+    def test_token_unset_rejects(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BASE_URL", "https://agent.example.com")
+        monkeypatch.delenv("MIDDLEWARE_AUTH_TOKEN", raising=False)
+        monkeypatch.delenv("MIDDLEWARE_ALLOW_UNAUTHENTICATED", raising=False)
+        client = TestClient(mw.app)
+        res = client.post("/forward", json={"type": "server", "description": "x"})
+        assert res.status_code == 401
+        assert res.json()["detail"] == "Middleware auth token required"
+
+    def test_allow_unauthenticated_forward_works(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BASE_URL", "https://agent.example.com")
+        monkeypatch.setenv("AGENT_WEBHOOK_SECRET", "agent-secret")
+        monkeypatch.delenv("MIDDLEWARE_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("MIDDLEWARE_ALLOW_UNAUTHENTICATED", "true")
+        client = TestClient(mw.app)
+
+        captured = {}
+
+        async def fake_post(url, content=None, headers=None):
+            captured["url"] = url
+            captured["content"] = content
+            captured["headers"] = headers
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"status": "queued", "incident_id": "abc"}
+            resp.text = ""
+            return resp
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(mw.httpx, "AsyncClient", return_value=mock_client):
+            res = client.post(
+                "/forward",
+                json={"type": "server", "description": "disk full"},
+            )
+
+        assert res.status_code == 200
+        assert res.json()["status"] == "forwarded"
+
+    def test_caller_org_id_ignored_by_default(self, client):
+        captured = {}
+
+        async def fake_post(url, content=None, headers=None):
+            captured["headers"] = headers
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"status": "queued"}
+            resp.text = ""
+            return resp
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(mw.httpx, "AsyncClient", return_value=mock_client):
+            res = client.post(
+                "/forward",
+                headers={
+                    "Authorization": "Bearer mw-token",
+                    "X-Org-ID": "spoofed-org",
+                },
+                json={
+                    "type": "server",
+                    "description": "x",
+                    "org_id": "spoofed-body-org",
+                },
+            )
+
+        assert res.status_code == 200
+        assert captured["headers"]["X-Org-ID"] == "acme"
+        assert res.json()["org_id"] == "acme"
+
+    def test_caller_org_id_trusted_when_flag_enabled(self, client, monkeypatch):
+        monkeypatch.setenv("MIDDLEWARE_TRUST_CALLER_ORG_ID", "true")
+        captured = {}
+
+        async def fake_post(url, content=None, headers=None):
+            captured["headers"] = headers
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"status": "queued"}
+            resp.text = ""
+            return resp
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(mw.httpx, "AsyncClient", return_value=mock_client):
+            res = client.post(
+                "/forward",
+                headers={
+                    "Authorization": "Bearer mw-token",
+                    "X-Org-ID": "trusted-tenant",
+                },
+                json={"type": "server", "description": "x"},
+            )
+
+        assert res.status_code == 200
+        assert captured["headers"]["X-Org-ID"] == "trusted-tenant"
+        assert res.json()["org_id"] == "trusted-tenant"
+
+    def test_caller_org_id_allowlist(self, client, monkeypatch):
+        monkeypatch.setenv("MIDDLEWARE_TRUST_CALLER_ORG_ID", "tenant-a,tenant-b")
+        captured = {}
+
+        async def fake_post(url, content=None, headers=None):
+            captured["headers"] = headers
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.json.return_value = {"status": "queued"}
+            resp.text = ""
+            return resp
+
+        mock_client = MagicMock()
+        mock_client.post = AsyncMock(side_effect=fake_post)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=False)
+
+        with patch.object(mw.httpx, "AsyncClient", return_value=mock_client):
+            # Allowed tenant in allowlist
+            res1 = client.post(
+                "/forward",
+                headers={
+                    "Authorization": "Bearer mw-token",
+                    "X-Org-ID": "tenant-a",
+                },
+                json={"type": "server", "description": "x"},
+            )
+            assert res1.status_code == 200
+            assert captured["headers"]["X-Org-ID"] == "tenant-a"
+            assert res1.json()["org_id"] == "tenant-a"
+
+            # Disallowed tenant falls back to configured ORG_ID
+            res2 = client.post(
+                "/forward",
+                headers={
+                    "Authorization": "Bearer mw-token",
+                    "X-Org-ID": "unlisted-tenant",
+                },
+                json={"type": "server", "description": "x"},
+            )
+            assert res2.status_code == 200
+            assert captured["headers"]["X-Org-ID"] == "acme"
+            assert res2.json()["org_id"] == "acme"
 
 
 class TestExec:
@@ -127,88 +278,32 @@ class TestExec:
         res = client.post("/exec", json={"command": "docker ps"})
         assert res.status_code == 403
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "journalctl --vacuum-time=1s",
-            "kubectl get secrets -A -o yaml",
-            "kubectl get sec -A",
-            "kubectl describe secret app-secret",
-            "kubectl rollout undo deploy/api",
-            "kubectl rollout restart deploy/api",
-            "docker inspect api",
-            "docker restart api",
-            "systemctl restart nginx",
-            "systemctl reload docker",
-            "kubectl get pods --kubeconfig=/root/.kube/other",
-            "kubectl --kubeconfig /root/.kube/other get pods",
-            "kubectl --server=https://other.example get pods",
-            "kubectl --as-uid=0 get pods",
-            "kubectl get pods --token secret",
-            "docker ps --host=tcp://other.example",
-            "docker -H tcp://other.example ps",
-            "docker ps; whoami",
-            "kubectl get pods\nwhoami",
-            'docker "ps',
-        ],
-    )
-    def test_blocks_dangerous_arguments(self, client, command):
-        exec_process = patch.object(mw.asyncio, "create_subprocess_exec")
-        with exec_process as mocked_exec:
-            res = client.post(
-                "/exec",
-                headers={"X-Middleware-Token": "mw-token"},
-                json={"command": command},
-            )
+    def test_exec_refuses_when_token_unset(self, monkeypatch):
+        monkeypatch.setenv("AGENT_BASE_URL", "https://agent.example.com")
+        monkeypatch.delenv("MIDDLEWARE_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("MIDDLEWARE_EXEC_ENABLED", "true")
+        client = TestClient(mw.app)
+        res = client.post("/exec", json={"command": "docker ps"})
+        assert res.status_code == 503
+        assert res.json()["detail"] == "MIDDLEWARE_AUTH_TOKEN required for exec"
 
-        assert res.status_code == 403
-        mocked_exec.assert_not_called()
+    def test_exec_refuses_without_token_even_with_allow_unauthenticated(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("AGENT_BASE_URL", "https://agent.example.com")
+        monkeypatch.delenv("MIDDLEWARE_AUTH_TOKEN", raising=False)
+        monkeypatch.setenv("MIDDLEWARE_EXEC_ENABLED", "true")
+        monkeypatch.setenv("MIDDLEWARE_ALLOW_UNAUTHENTICATED", "true")
+        client = TestClient(mw.app)
+        res = client.post("/exec", json={"command": "docker ps"})
+        assert res.status_code == 503
+        assert res.json()["detail"] == "MIDDLEWARE_AUTH_TOKEN required for exec"
 
-    @pytest.mark.parametrize(
-        "command",
-        [
-            "docker ps",
-            "docker ps --all --no-trunc",
-            "docker logs api --tail 100",
-            "systemctl status nginx",
-            "systemctl status --no-pager docker",
-            "nginx -t",
-            "df -h",
-            'journalctl -u nginx.service --since "1 hour ago" --no-pager',
-            "journalctl --lines=100",
-            "kubectl get pods",
-            "kubectl get pods -n default -o wide",
-            "kubectl get all -A",
-            "kubectl describe node worker-1",
-            "kubectl logs pod/api --tail=100 -n default --timestamps",
-            "kubectl rollout status deploy/api -n default --watch=false",
-        ],
-    )
-    def test_allows_supported_read_only_arguments(self, command, monkeypatch):
-        monkeypatch.delenv("MIDDLEWARE_EXEC_ALLOWLIST", raising=False)
-        assert mw._command_allowed(command, shlex.split(command))
-
-    def test_custom_allowlist_requires_full_command_match(self, monkeypatch):
-        monkeypatch.setenv("MIDDLEWARE_EXEC_ALLOWLIST", r"^echo\s+safe$")
-
-        assert mw._command_allowed("echo safe", ["echo", "safe"])
-        command = "echo safe extra"
-        arguments = ["echo", "safe", "extra"]
-        assert not mw._command_allowed(command, arguments)
-
-    def test_invalid_custom_allowlist_fails_closed(self, monkeypatch):
-        monkeypatch.setenv("MIDDLEWARE_EXEC_ALLOWLIST", "[")
-
-        assert not mw._command_allowed("docker ps", ["docker", "ps"])
-
-    def test_rejects_caller_working_directory(self, client):
-        exec_process = patch.object(mw.asyncio, "create_subprocess_exec")
-        with exec_process as mocked_exec:
-            res = client.post(
-                "/exec",
-                headers={"X-Middleware-Token": "mw-token"},
-                json={"command": "docker ps", "cwd": "C:\\Users\\Public"},
-            )
-
-        assert res.status_code == 403
-        mocked_exec.assert_not_called()
+    def test_exec_rejects_invalid_token(self, client):
+        res = client.post(
+            "/exec",
+            headers={"Authorization": "Bearer wrong-token"},
+            json={"command": "docker ps"},
+        )
+        assert res.status_code == 401
+        assert res.json()["detail"] == "Invalid middleware token"

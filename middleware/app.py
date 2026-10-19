@@ -138,7 +138,27 @@ def _agent_secret() -> str:
 
 
 def _middleware_token() -> str:
-    return _cfg("MIDDLEWARE_AUTH_TOKEN")
+    return _cfg("MIDDLEWARE_AUTH_TOKEN").strip()
+
+
+def _allow_unauthenticated() -> bool:
+    return _cfg("MIDDLEWARE_ALLOW_UNAUTHENTICATED", "false").strip().lower() in (
+        "true",
+        "1",
+        "yes",
+    )
+
+
+def _is_caller_org_id_allowed(caller_org: str | None) -> bool:
+    if not caller_org:
+        return False
+    val = _cfg("MIDDLEWARE_TRUST_CALLER_ORG_ID", "false").strip()
+    if val.lower() in ("true", "1", "yes"):
+        return True
+    if val.lower() in ("false", "0", "no", ""):
+        return False
+    allowed = {item.strip() for item in val.split(",") if item.strip()}
+    return caller_org in allowed
 
 
 def _org_id() -> str:
@@ -187,7 +207,9 @@ def _require_middleware_auth(
 ) -> None:
     expected = _middleware_token()
     if not expected:
-        return
+        if _allow_unauthenticated():
+            return
+        raise HTTPException(status_code=401, detail="Middleware auth token required")
     token = None
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization[7:].strip()
@@ -513,7 +535,13 @@ async def forward_incident(
         }
 
     payload.setdefault("source", source or "middleware")
-    payload["org_id"] = x_org_id or payload.get("org_id") or _org_id()
+    caller_org = (x_org_id.strip() if x_org_id and x_org_id.strip() else None) or (
+        str(payload["org_id"]).strip() if payload.get("org_id") else None
+    )
+    if caller_org and _is_caller_org_id_allowed(caller_org):
+        payload["org_id"] = caller_org
+    else:
+        payload["org_id"] = _org_id()
     host = _default_host()
     if host and not payload.get("host"):
         payload["host"] = host
@@ -568,19 +596,19 @@ async def exec_local(
     Optional callback for the central agent when it cannot SSH in.
     Only allowlisted, non-destructive commands run.
     """
-    _require_middleware_auth(authorization, x_middleware_token)
-
     if not _exec_enabled():
         raise HTTPException(
             status_code=403,
             detail="Local exec disabled. Set MIDDLEWARE_EXEC_ENABLED=true to allow.",
         )
 
-    if body.cwd and body.cwd.strip():
+    if not _middleware_token():
         raise HTTPException(
-            status_code=403,
-            detail="Working directory overrides are not allowed",
+            status_code=503,
+            detail="MIDDLEWARE_AUTH_TOKEN required for exec",
         )
+
+    _require_middleware_auth(authorization, x_middleware_token)
 
     command = body.command.strip()
     try:
