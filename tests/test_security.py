@@ -249,3 +249,55 @@ class TestWebhookEndpoints:
         response = client.get("/health")
         assert response.status_code == 200
         assert response.json()["emergency_stop"] is True
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/webhook/github",
+            "/webhook/alertmanager",
+            "/webhook/gitlab",
+            "/webhook/bitbucket",
+            "/webhook/manual",
+        ],
+    )
+    def test_webhook_malformed_json_returns_400(self, monkeypatch, path):
+        secret = "test-secret"
+        monkeypatch.setenv("WEBHOOK_SECRET", secret)
+        from api.server import app
+
+        body = b"not json"
+        sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+        client = TestClient(app)
+        response = client.post(
+            path,
+            content=body,
+            headers={"X-Hub-Signature-256": sig},
+        )
+        assert response.status_code == 400
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/webhook/github",
+            "/webhook/alertmanager",
+            "/webhook/gitlab",
+            "/webhook/bitbucket",
+            "/webhook/manual",
+        ],
+    )
+    def test_webhook_non_object_json_returns_400(self, monkeypatch, path):
+        secret = "test-secret"
+        monkeypatch.setenv("WEBHOOK_SECRET", secret)
+        from api.server import app
+
+        body = b"null"
+        sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+
+        client = TestClient(app)
+        response = client.post(
+            path,
+            content=body,
+            headers={"X-Hub-Signature-256": sig},
+        )
+        assert response.status_code == 400
