@@ -83,7 +83,9 @@ curl -X POST http://middleware.internal:8080/exec \
   -d '{"command":"docker ps"}'
 ```
 
-Destructive commands (`rm -rf`, pipe-to-shell, etc.) are always blocked.
+The built-in policy rejects destructive command patterns such as `rm -rf` and pipe-to-shell. The administrator-defined regular expression override is trusted code-execution policy and can add commands beyond the built-in set.
+
+The default policy validates the complete argument list and permits only supported read-only command forms. It rejects a request-supplied working directory, Kubernetes secrets, connection/credential overrides, and mutating subcommands such as service restarts or rollout changes. `MIDDLEWARE_EXEC_ALLOWLIST` is an optional administrator override containing comma-separated regular expressions; each pattern must match the complete command. Treat this override as trusted command-execution configuration.
 
 ## Env
 

@@ -1,8 +1,10 @@
 """Edge middleware: forward signing, auth, and exec allowlist."""
+
 from __future__ import annotations
 
 import hashlib
 import hmac
+import shlex
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +26,7 @@ def client(monkeypatch):
     monkeypatch.setenv("ORG_ID", "acme")
     monkeypatch.setenv("MIDDLEWARE_EXEC_ENABLED", "true")
     monkeypatch.delenv("MIDDLEWARE_DEFAULT_HOST", raising=False)
+    monkeypatch.delenv("MIDDLEWARE_EXEC_ALLOWLIST", raising=False)
     return TestClient(mw.app)
 
 
@@ -70,9 +73,10 @@ class TestForward:
         assert body["status"] == "forwarded"
         assert captured["url"] == "https://agent.example.com/webhook/manual"
         sig = captured["headers"]["X-Hub-Signature-256"]
-        expected = "sha256=" + hmac.new(
+        expected_digest = hmac.new(
             b"agent-secret", captured["content"], hashlib.sha256
         ).hexdigest()
+        expected = "sha256=" + expected_digest
         assert sig == expected
         assert captured["headers"]["X-Org-ID"] == "acme"
 
@@ -87,6 +91,8 @@ class TestExec:
         assert res.status_code == 403
 
     def test_allows_docker_ps(self, client):
+        proc_call = {}
+
         class FakeProc:
             returncode = 0
 
@@ -97,6 +103,8 @@ class TestExec:
                 return None
 
         async def fake_exec(*args, **kwargs):
+            proc_call["args"] = args
+            proc_call["cwd"] = kwargs.get("cwd")
             return FakeProc()
 
         with patch.object(mw.asyncio, "create_subprocess_exec", side_effect=fake_exec):
@@ -109,6 +117,7 @@ class TestExec:
         assert res.status_code == 200
         assert res.json()["success"] is True
         assert "CONTAINER" in res.json()["stdout"]
+        assert proc_call == {"args": ("docker", "ps"), "cwd": None}
 
     def test_exec_disabled(self, monkeypatch):
         monkeypatch.setenv("AGENT_BASE_URL", "https://agent.example.com")
@@ -117,3 +126,89 @@ class TestExec:
         client = TestClient(mw.app)
         res = client.post("/exec", json={"command": "docker ps"})
         assert res.status_code == 403
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "journalctl --vacuum-time=1s",
+            "kubectl get secrets -A -o yaml",
+            "kubectl get sec -A",
+            "kubectl describe secret app-secret",
+            "kubectl rollout undo deploy/api",
+            "kubectl rollout restart deploy/api",
+            "docker inspect api",
+            "docker restart api",
+            "systemctl restart nginx",
+            "systemctl reload docker",
+            "kubectl get pods --kubeconfig=/root/.kube/other",
+            "kubectl --kubeconfig /root/.kube/other get pods",
+            "kubectl --server=https://other.example get pods",
+            "kubectl --as-uid=0 get pods",
+            "kubectl get pods --token secret",
+            "docker ps --host=tcp://other.example",
+            "docker -H tcp://other.example ps",
+            "docker ps; whoami",
+            "kubectl get pods\nwhoami",
+            'docker "ps',
+        ],
+    )
+    def test_blocks_dangerous_arguments(self, client, command):
+        exec_process = patch.object(mw.asyncio, "create_subprocess_exec")
+        with exec_process as mocked_exec:
+            res = client.post(
+                "/exec",
+                headers={"X-Middleware-Token": "mw-token"},
+                json={"command": command},
+            )
+
+        assert res.status_code == 403
+        mocked_exec.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "docker ps",
+            "docker ps --all --no-trunc",
+            "docker logs api --tail 100",
+            "systemctl status nginx",
+            "systemctl status --no-pager docker",
+            "nginx -t",
+            "df -h",
+            'journalctl -u nginx.service --since "1 hour ago" --no-pager',
+            "journalctl --lines=100",
+            "kubectl get pods",
+            "kubectl get pods -n default -o wide",
+            "kubectl get all -A",
+            "kubectl describe node worker-1",
+            "kubectl logs pod/api --tail=100 -n default --timestamps",
+            "kubectl rollout status deploy/api -n default --watch=false",
+        ],
+    )
+    def test_allows_supported_read_only_arguments(self, command, monkeypatch):
+        monkeypatch.delenv("MIDDLEWARE_EXEC_ALLOWLIST", raising=False)
+        assert mw._command_allowed(command, shlex.split(command))
+
+    def test_custom_allowlist_requires_full_command_match(self, monkeypatch):
+        monkeypatch.setenv("MIDDLEWARE_EXEC_ALLOWLIST", r"^echo\s+safe$")
+
+        assert mw._command_allowed("echo safe", ["echo", "safe"])
+        command = "echo safe extra"
+        arguments = ["echo", "safe", "extra"]
+        assert not mw._command_allowed(command, arguments)
+
+    def test_invalid_custom_allowlist_fails_closed(self, monkeypatch):
+        monkeypatch.setenv("MIDDLEWARE_EXEC_ALLOWLIST", "[")
+
+        assert not mw._command_allowed("docker ps", ["docker", "ps"])
+
+    def test_rejects_caller_working_directory(self, client):
+        exec_process = patch.object(mw.asyncio, "create_subprocess_exec")
+        with exec_process as mocked_exec:
+            res = client.post(
+                "/exec",
+                headers={"X-Middleware-Token": "mw-token"},
+                json={"command": "docker ps", "cwd": "C:\\Users\\Public"},
+            )
+
+        assert res.status_code == 403
+        mocked_exec.assert_not_called()
