@@ -39,6 +39,17 @@ class AzureBlobStorage(StorageProvider):
     def put_json(self, key: str, data: Any) -> str:
         return self.put_bytes(key, json.dumps(data, indent=2, default=str).encode("utf-8"), "application/json")
 
+    def put_json_if_absent(self, key: str, data: Any) -> bool:
+        from azure.core.exceptions import ResourceExistsError
+
+        blob = self._container_client.get_blob_client(key)
+        body = json.dumps(data, indent=2, default=str).encode("utf-8")
+        try:
+            blob.upload_blob(body, overwrite=False, content_type="application/json")
+            return True
+        except ResourceExistsError:
+            return False
+
     def get_bytes(self, key: str) -> Optional[bytes]:
         blob = self._container_client.get_blob_client(key)
         if not blob.exists():

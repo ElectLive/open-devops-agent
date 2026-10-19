@@ -53,6 +53,29 @@ class S3Storage(StorageProvider):
     def put_json(self, key: str, data: Any) -> str:
         return self.put_bytes(key, json.dumps(data, indent=2, default=str).encode("utf-8"), "application/json")
 
+    def put_json_if_absent(self, key: str, data: Any) -> bool:
+        body = json.dumps(data, indent=2, default=str).encode("utf-8")
+        try:
+            from botocore.exceptions import ClientError, ParamValidationError
+        except ImportError:
+            return super().put_json_if_absent(key, data)
+        try:
+            self._client.put_object(
+                Bucket=self.bucket,
+                Key=key,
+                Body=body,
+                ContentType="application/json",
+                IfNoneMatch="*",
+            )
+            return True
+        except ParamValidationError:
+            return super().put_json_if_absent(key, data)
+        except ClientError as exc:
+            code = exc.response.get("Error", {}).get("Code", "")
+            if code in {"PreconditionFailed", "ConditionalRequestConflict"}:
+                return False
+            raise
+
     def get_bytes(self, key: str) -> Optional[bytes]:
         try:
             resp = self._client.get_object(Bucket=self.bucket, Key=key)

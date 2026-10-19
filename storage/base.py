@@ -18,6 +18,17 @@ class StorageProvider(ABC):
     def put_json(self, key: str, data: Any) -> str:
         """Store JSON-serializable data."""
 
+    def put_json_if_absent(self, key: str, data: Any) -> bool:
+        """Return True when this caller creates a previously missing JSON key.
+
+        Subclasses must override this fallback with an atomic conditional create
+        for concurrent claims; this check-then-write implementation is not atomic.
+        """
+        if self.exists(key):
+            return False
+        self.put_json(key, data)
+        return True
+
     @abstractmethod
     def get_bytes(self, key: str) -> Optional[bytes]:
         """Fetch raw bytes or None if missing."""

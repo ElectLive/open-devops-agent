@@ -1,7 +1,9 @@
 """Tests for PII scrubber, storage, grounding, and incident queue."""
 import asyncio
 import importlib
+import multiprocessing
 import os
+import threading
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -75,6 +77,66 @@ class TestIncidentQueue:
         assert recovered == 1
         entry = queue.claim_next("test-org")
         assert entry["incident_id"] == incident_id
+
+    def test_concurrent_claims_return_one_incident(self):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        incident_id = queue.enqueue("test-org", {"type": "server"})
+        barrier = threading.Barrier(8)
+        found = []
+
+        def claim():
+            barrier.wait()
+            found.append(queue.claim_next("test-org"))
+
+        threads = [threading.Thread(target=claim) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        claimed = [entry for entry in found if entry is not None]
+        assert len(claimed) == 1
+        assert claimed[0]["incident_id"] == incident_id
+        assert claimed[0]["attempts"] == 1
+        assert queue.claim_next("test-org") is None
+
+
+def _child_background_lock_is_taken(repo: str, lock_path: str, result) -> None:
+    import sys
+
+    sys.path.insert(0, repo)
+    os.environ["BACKGROUND_WORKER_LOCK"] = lock_path
+    from services.background_lock import acquire_background_worker_lock
+
+    result.put(acquire_background_worker_lock() is None)
+
+
+class TestBackgroundWorkerLock:
+    def test_second_process_does_not_acquire_the_lock(self, tmp_path, monkeypatch):
+        from services.background_lock import (
+            acquire_background_worker_lock,
+            release_background_worker_lock,
+        )
+
+        lock_path = str(tmp_path / "background.lock")
+        monkeypatch.setenv("BACKGROUND_WORKER_LOCK", lock_path)
+        held = acquire_background_worker_lock()
+        assert held is not None
+        try:
+            repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            ctx = multiprocessing.get_context("spawn")
+            result = ctx.Queue()
+            proc = ctx.Process(
+                target=_child_background_lock_is_taken,
+                args=(repo, lock_path, result),
+            )
+            proc.start()
+            assert result.get(timeout=30) is True
+            proc.join(timeout=30)
+            assert proc.exitcode == 0
+        finally:
+            release_background_worker_lock(held)
 
 
 class TestIncidentStore:

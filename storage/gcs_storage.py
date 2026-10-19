@@ -25,6 +25,17 @@ class GCSStorage(StorageProvider):
     def put_json(self, key: str, data: Any) -> str:
         return self.put_bytes(key, json.dumps(data, indent=2, default=str).encode("utf-8"), "application/json")
 
+    def put_json_if_absent(self, key: str, data: Any) -> bool:
+        from google.api_core.exceptions import PreconditionFailed
+
+        blob = self._bucket.blob(key)
+        body = json.dumps(data, indent=2, default=str)
+        try:
+            blob.upload_from_string(body, content_type="application/json", if_generation_match=0)
+            return True
+        except PreconditionFailed:
+            return False
+
     def get_bytes(self, key: str) -> Optional[bytes]:
         blob = self._bucket.blob(key)
         if not blob.exists():

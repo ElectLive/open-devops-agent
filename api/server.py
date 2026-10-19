@@ -25,6 +25,10 @@ from api.webhook_auth import (
     verify_webhook_auth,
     verify_webhook_request,
 )
+from services.background_lock import (
+    acquire_background_worker_lock,
+    release_background_worker_lock,
+)
 from services.incident_queue import IncidentQueue
 from services.incident_store import IncidentStore
 from services.org_docs import OrgDocs
@@ -49,6 +53,7 @@ escalation_service = EscalationService()
 
 _queue_worker_task: Optional[asyncio.Task] = None
 _retention_task: Optional[asyncio.Task] = None
+_background_lock_handle = None
 _queue_running = False
 
 RETENTION_INTERVAL_SEC = 24 * 60 * 60  # one retention pass per day
@@ -213,21 +218,30 @@ async def enqueue_incident(context: dict, incident_id: Optional[str] = None) -> 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _queue_worker_task, _retention_task
+    global _queue_worker_task, _retention_task, _background_lock_handle, _queue_running
     log.info("DevOps AI Agent starting", auto_apply=os.getenv("AUTO_APPLY", "false"))
-    _queue_worker_task = asyncio.create_task(_queue_worker_loop())
-    _retention_task = asyncio.create_task(_retention_loop())
-    yield
-    global _queue_running
-    _queue_running = False
-    for task in (_queue_worker_task, _retention_task):
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-    log.info("DevOps AI Agent shutting down")
+    _background_lock_handle = acquire_background_worker_lock()
+    if _background_lock_handle is None:
+        log.info("Queue and retention loops are already running in another process")
+    else:
+        _queue_worker_task = asyncio.create_task(_queue_worker_loop())
+        _retention_task = asyncio.create_task(_retention_loop())
+    try:
+        yield
+    finally:
+        _queue_running = False
+        for task in (_queue_worker_task, _retention_task):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        _queue_worker_task = None
+        _retention_task = None
+        release_background_worker_lock(_background_lock_handle)
+        _background_lock_handle = None
+        log.info("DevOps AI Agent shutting down")
 
 
 app = FastAPI(
