@@ -111,7 +111,10 @@ class SafeExecutor:
         if command.startswith(APPROVAL_REFERENCE_PREFIX):
             # Resolve in the approving process so memory-backed storage works,
             # too. The retained operation already binds its target host.
-            retained = None if host else CommandApprovalStore().resolve(command)
+            try:
+                retained = None if host else CommandApprovalStore().resolve(command)
+            except RuntimeError:
+                retained = None
             if retained is None:
                 return {
                     "blocked": True,
