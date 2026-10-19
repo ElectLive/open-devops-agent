@@ -216,18 +216,30 @@ class TestNginxTools:
         assert _is_valid_domain("example..com") is False
 
     def test_write_file_command_prevents_shell_expansion(self, tmp_path):
+        import shlex
         import subprocess
 
         target_file = tmp_path / "test.conf"
-        danger_content = "server { # $(touch /tmp/evil_shell_test)\n # `touch /tmp/evil2`\n ; echo evil\n }"
+        marker_subst = tmp_path / "expanded_subst"
+        marker_backtick = tmp_path / "expanded_backtick"
+        danger_content = (
+            f"server {{ # $(touch {marker_subst})\n"
+            f" # `touch {marker_backtick}`\n ; echo evil\n }}"
+        )
         cmd = _write_file_command(str(target_file), danger_content)
 
-        # Confirm command uses python3 -c and passes argument safely quoted
-        assert cmd.startswith("python3 -c '") or cmd.startswith('python3 -c "') or cmd.startswith("python3 -c ")
+        # The command is a single quoted python3 -c argument; content travels as base64.
+        argv = shlex.split(cmd)
+        assert argv[:2] == ["python3", "-c"]
+        assert len(argv) == 3
+        assert "$(" not in argv[2] and "`" not in argv[2]
 
-        # Run with shell=True to verify no expansion occurs and content is written verbatim
-        subprocess.run(cmd, shell=True, check=True)
+        # Run it through a real shell (as SafeExecutor does) without shell=True:
+        # nothing may be expanded and the content must be written verbatim.
+        subprocess.run(["sh", "-c", cmd], check=True)
         assert target_file.read_text() == danger_content
+        assert not marker_subst.exists()
+        assert not marker_backtick.exists()
 
     def test_certbot_command_quotes_domains_and_credentials(self, monkeypatch):
         monkeypatch.setenv("CERTBOT_DNS_PLUGIN", "cloudflare")
