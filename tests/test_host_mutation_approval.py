@@ -9,6 +9,7 @@ import json
 import re
 import runpy
 import shlex
+import sys
 import textwrap
 
 import pytest
@@ -184,7 +185,7 @@ def approval_executor(agent, monkeypatch, tmp_path, capsys):
 
     async def approved_exec(command, host=None):
         argv = shlex.split(command)
-        assert argv[:2] == ["python3", "-c"]
+        assert argv[:2] == [sys.executable, "-c"]
         assert len(argv) == 3
         assert host is None
         script = tmp_path / "approved_operation.py"
@@ -255,6 +256,30 @@ async def test_live_host_mutation_requires_approval(
     assert base64.b64decode(result["approval_payload"]).decode() == result["command"]
     assert "203.0.113.10" in result["command"]
     assert result["message"]
+
+
+@pytest.mark.asyncio
+async def test_approved_host_mutation_uses_agent_interpreter(agent, monkeypatch):
+    instance, runner = agent
+    monkeypatch.setenv("AUTO_APPLY", "false")
+    runner.forbid_all = True
+    approval = await instance.execute_tool("restart_nginx", {"host": "203.0.113.15"})
+    assert approval["requires_approval"] is True
+    assert runner.calls == []
+    commands = []
+
+    async def capture_command(command, host=None):
+        commands.append(command)
+        return {"success": True, "returncode": 0}
+
+    executor = SafeExecutor()
+    monkeypatch.setattr(executor, "_exec", capture_command)
+    result = await executor.run(approval["command"])
+
+    assert result["success"] is True
+    assert len(commands) == 1
+    assert commands[0].startswith(f"{shlex.quote(sys.executable)} -c ")
+    assert shlex.split(commands[0])[:2] == [sys.executable, "-c"]
 
 
 @pytest.mark.asyncio

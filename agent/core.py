@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import shlex
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -1829,6 +1830,8 @@ class DevOpsAgent:
             # Replay the entire helper, including validation and rollback.
             # Retain its arguments outside Slack's bounded button value.
             tool_type = type(tool)
+            # Replay inherits the agent's cwd; imports require the repo root
+            # as the working directory or the packages to be installed.
             script = (
                 "import asyncio, json, sys; "
                 f"from {tool_type.__module__} import {tool_type.__name__}; "
@@ -1839,7 +1842,7 @@ class DevOpsAgent:
                 "and result.get('success', result.get('applied', False)) is True else 1)"
             )
             command = CommandApprovalStore().retain(
-                f"python3 -c {shlex.quote(script)}", host=kwargs.get("host")
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}", host=kwargs.get("host")
             )
             return {
                 "blocked": True,
