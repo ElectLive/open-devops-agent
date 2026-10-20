@@ -283,6 +283,32 @@ async def test_approved_host_mutation_uses_agent_interpreter(agent, monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_approved_host_mutation_quotes_interpreter(agent, monkeypatch):
+    instance, runner = agent
+    monkeypatch.setenv("AUTO_APPLY", "false")
+    interpreter = "python env's/bin/python3"
+    monkeypatch.setattr("agent.core.sys.executable", interpreter)
+    runner.forbid_all = True
+    approval = await instance.execute_tool("restart_nginx", {"host": "203.0.113.16"})
+    assert approval["requires_approval"] is True
+    assert runner.calls == []
+    commands = []
+
+    async def capture_command(command, host=None):
+        commands.append(command)
+        return {"success": True, "returncode": 0}
+
+    executor = SafeExecutor()
+    monkeypatch.setattr(executor, "_exec", capture_command)
+    result = await executor.run(approval["command"])
+
+    assert result["success"] is True
+    assert len(commands) == 1
+    assert commands[0].startswith(f"{shlex.quote(interpreter)} -c ")
+    assert shlex.split(commands[0])[:2] == [interpreter, "-c"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("name", HOST_MUTATIONS)
 async def test_auto_apply_allows_live_host_mutation(agent, monkeypatch, name):
     instance, runner = agent
