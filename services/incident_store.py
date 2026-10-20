@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 
 import structlog
 
+from services.incident_queue import QUEUE_COMPLETED, QUEUE_FAILED, QUEUE_REVIEWS
 from services.pii_scrubber import scrub_dict, scrub_value
 from storage.base import StorageProvider
 from storage.factory import get_storage
@@ -81,15 +82,19 @@ class IncidentStore:
         return entries
 
     def apply_retention(self, org_id: str) -> int:
-        """Delete audit, log, checkpoint, and queue objects older than retention_days."""
+        """Expire aged payloads and retain minimal review dedupe records and fences."""
         if self.retention_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         month_cutoff = cutoff.replace(day=1)
         deleted = 0
+        review_prefix = self.storage.org_prefix(org_id, "queue", QUEUE_REVIEWS) + "/"
         for category in ("audit", "logs", "checkpoints", "queue"):
             prefix = self.storage.org_prefix(org_id, category)
             for key in self.storage.list_keys(prefix):
+                if key.startswith(review_prefix):
+                    self._compact_terminal_review(org_id, key, cutoff)
+                    continue
                 obj_date, month_granularity = _object_retention_date(self.storage, key, category)
                 if obj_date is None:
                     continue
@@ -100,6 +105,33 @@ class IncidentStore:
         if deleted:
             log.info("Retention cleanup", org_id=org_id, deleted=deleted)
         return deleted
+
+    def _compact_terminal_review(self, org_id: str, key: str, cutoff: datetime) -> None:
+        entry = self.storage.get_json(key)
+        if not entry or entry.get("status") not in (QUEUE_COMPLETED, QUEUE_FAILED):
+            return
+        ended_field = "completed_at" if entry["status"] == QUEUE_COMPLETED else "failed_at"
+        ended_at = _parse_iso_datetime(entry.get(ended_field))
+        if ended_at is None or ended_at >= cutoff:
+            return
+        minimal = {
+            "incident_id": entry["incident_id"],
+            "org_id": org_id,
+            "status": entry["status"],
+            ended_field: entry[ended_field],
+        }
+        claim_key = self.storage.org_prefix(
+            org_id, "review_claims", f"{entry['incident_id']}.json"
+        )
+        # Replace the fence in place: a stale pending snapshot must still lose.
+        for record_key in (claim_key, key):
+            if self.storage.get_json(record_key) != minimal:
+                self.storage.put_json(record_key, minimal)
+                log.info(
+                    "Compacted terminal review",
+                    org_id=org_id,
+                    incident_id=entry["incident_id"],
+                )
 
 
 _RETENTION_TIMESTAMP_FIELDS = (

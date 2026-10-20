@@ -5,7 +5,10 @@ import hashlib
 import hmac
 import json
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -16,6 +19,9 @@ from api.webhook_auth import (
     verify_slack_signature,
     verify_webhook_request,
 )
+from services.incident_queue import IncidentQueue
+from services.incident_store import IncidentStore
+from storage.memory_storage import MemoryStorage
 from tools.executor import SafeExecutor
 from tools.safety import requires_configured_approval
 from tools.ssh_utils import build_ssh_command
