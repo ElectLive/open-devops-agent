@@ -122,6 +122,7 @@ class RecordingRunner:
         self.allow_mutations = False
         self.forbid_all = False
         self.fail_prefix = None
+        self.find_stdout = "/var/log/syslog.1.gz\n"
 
     async def __call__(self, command, host):
         self.calls.append((command, host))
@@ -143,7 +144,7 @@ class RecordingRunner:
         )
         assert not self.forbid_all, f"Command ran before operation approval: {command}"
         assert self.allow_mutations or read_only, f"Unapproved mutation: {command}"
-        stdout = "/var/log/syslog.1.gz\n" if command.startswith("find ") else "active"
+        stdout = self.find_stdout if command.startswith("find ") else "active"
         ok = not self.fail_prefix or not command.startswith(self.fail_prefix)
         return {
             "success": ok,
@@ -507,6 +508,80 @@ async def test_approved_helper_command_failure_preserves_status(
     assert json.loads(result["stdout"])[contract] is False
     assert result["returncode"] != 0
     assert result["success"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "scenario,fail_prefix,expected_success",
+    [
+        ("vacuum-time", "journalctl --vacuum-time=", False),
+        ("vacuum-size", "journalctl --vacuum-size=", False),
+        ("delete", "rm -f --", False),
+        ("protected", None, True),
+        ("recheck", None, True),
+    ],
+)
+async def test_approved_cleanup_result_controls_notification(
+    agent, approval_executor, monkeypatch, scenario, fail_prefix, expected_success
+):
+    instance, runner = agent
+    monkeypatch.setenv("AUTO_APPLY", "false")
+    runner.forbid_all = True
+    approval = await instance.execute_tool(
+        "cleanup_stale_logs", {"dry_run": False, "host": "203.0.113.35"}
+    )
+    assert approval["requires_approval"] is True
+    assert runner.calls == []
+    if scenario == "protected":
+        runner.find_stdout = "/var/log/production.log.1\n"
+    elif scenario == "recheck":
+        monkeypatch.setattr("tools.disk_cleanup.is_safe_stale_log", lambda path: False)
+    runner.forbid_all = False
+    runner.allow_mutations = True
+    runner.fail_prefix = fail_prefix
+    results, messages = [], []
+    replay = approval_executor.run
+
+    async def record_result(command, host=None):
+        result = await replay(command, host=host)
+        results.append(result)
+        return result
+
+    class Notifier:
+        async def send_message(self, message):
+            messages.append(message)
+
+    monkeypatch.setattr(approval_executor, "run", record_result)
+    instance.executor = approval_executor
+    instance.notifier = Notifier()
+    await instance.execute_approved_action("cleanup-approval", approval["command"])
+
+    assert len(results) == 1
+    result = results[0]
+    assert result["success"] is expected_success, result
+    assert (result["returncode"] == 0) is expected_success
+    operation = json.loads(result["stdout"].splitlines()[-1])
+    assert operation["applied"] is True
+    assert len(messages) == 1
+    if expected_success:
+        assert "✅ Approved action executed" in messages[0]
+        assert operation["deleted"] == []
+        assert not any(command.startswith("rm ") for command, _ in runner.calls)
+        if scenario == "protected":
+            assert operation["alerts"][0]["status"] == "protected"
+            assert operation["skipped"] == []
+        else:
+            assert operation["skipped"][0]["reason"]
+            assert "error" not in operation["skipped"][0]
+    else:
+        assert "❌ Approved action failed" in messages[0]
+        assert "Approved action executed" not in messages[0]
+        assert any(command.startswith(fail_prefix) for command, _ in runner.calls)
+        if scenario == "delete":
+            assert "error" in operation["skipped"][0]
+        else:
+            assert any(item["success"] is False for item in operation["journal"])
+    assert all(host == "203.0.113.35" for _, host in runner.calls)
 
 
 @pytest.mark.asyncio
