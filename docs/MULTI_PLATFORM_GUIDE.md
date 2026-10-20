@@ -394,6 +394,16 @@ curl -X POST http://localhost:8000/webhook/manual \
 3. Select trigger: **Pipeline events**
 4. Add secret token (optional but recommended)
 
+### Bitbucket Webhooks
+
+1. Go to your Bitbucket repository → **Settings** → **Webhooks** → **Add webhook**
+2. Set URL: `https://your-agent.com/webhook/bitbucket`
+3. Enter a **Secret** and configure the same value as `WEBHOOK_SECRET` on the server
+4. Select the pull request triggers you need and save the webhook
+
+Bitbucket Cloud signs the raw request body with HMAC SHA-256 and sends
+`X-Hub-Signature: sha256=<hex>`. See [Bitbucket's webhook security documentation](https://support.atlassian.com/bitbucket-cloud/docs/manage-webhooks/#Validating-webhook-deliveries).
+
 ### Azure DevOps Webhooks
 
 1. Go to your project → **Project Settings** → **Service Hooks**

@@ -2,8 +2,11 @@
 DevOps AI Agent — Core Agent Loop
 Uses Claude's tool_use to reason, decide, and act on infrastructure incidents.
 """
+import base64
 import json
 import os
+import shlex
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -53,6 +56,7 @@ from tools.data_state import DataStateTools
 from tools.code_review import CodeReviewTools, detect_platform_from_url
 from collectors.database_policy import check_database_access
 from services.incident_store import IncidentStore
+from services.approval_store import CommandApprovalStore
 from services.org_docs import OrgDocs
 from services.org_context import org_agent_credentials
 from services.pii_scrubber import scrub_dict, scrub_text, scrub_value
@@ -1230,8 +1234,9 @@ class DevOpsAgent:
                     f"🛑 Emergency stop active — approved action blocked for `{incident_id}`:\n```{command}```"
                 )
                 return
+            status = "✅ Approved action executed" if result.get("success") else "❌ Approved action failed"
             await self.notifier.send_message(
-                f"✅ Approved action executed for `{incident_id}`:\n```{command}```\nResult: {result.get('stdout', '')}"
+                f"{status} for `{incident_id}`:\n```{command}```\nResult: {result.get('stdout', '')}"
             )
 
     async def _collect_context(self, context: dict) -> dict:
@@ -1585,38 +1590,44 @@ class DevOpsAgent:
             elif name == "inspect_disk_usage":
                 return await self.disk_cleanup.inspect(inputs.get("host") or context.get("host"))
             elif name == "cleanup_stale_logs":
-                return await self.disk_cleanup.apply(
+                return await self._execute_host_mutation(
+                    self.disk_cleanup, "apply",
                     host=inputs.get("host") or context.get("host"),
                     dry_run=inputs.get("dry_run", True),
                 )
             elif name == "install_log_cleanup_cron":
-                return await self.disk_cleanup.install_cron(
+                return await self._execute_host_mutation(
+                    self.disk_cleanup, "install_cron",
                     host=inputs.get("host") or context.get("host"),
                     dry_run=inputs.get("dry_run", True),
                 )
             elif name == "diagnose_nginx":
                 return await self.nginx_tools.diagnose(inputs.get("host") or context.get("host"))
             elif name == "apply_nginx_config":
-                return await self.nginx_tools.apply_nginx_config(
-                    inputs["file_path"],
-                    inputs["new_content"],
+                return await self._execute_host_mutation(
+                    self.nginx_tools, "apply_nginx_config",
+                    file_path=inputs["file_path"],
+                    new_content=inputs["new_content"],
                     host=inputs.get("host") or context.get("host"),
                 )
             elif name == "restart_nginx":
-                return await self.nginx_tools.restart(
+                return await self._execute_host_mutation(
+                    self.nginx_tools, "restart",
                     host=inputs.get("host") or context.get("host"),
                     reload_only=inputs.get("reload_only", False),
                     config_path=inputs.get("config_path"),
                     config_content=inputs.get("config_content"),
                 )
             elif name == "renew_certificates":
-                return await self.nginx_tools.renew_certificates(
+                return await self._execute_host_mutation(
+                    self.nginx_tools, "renew_certificates",
                     host=inputs.get("host") or context.get("host"),
                     dry_run=inputs.get("dry_run", True),
                     domains=inputs.get("domains"),
                 )
             elif name == "apply_security_updates":
-                return await self.security_updates.apply(
+                return await self._execute_host_mutation(
+                    self.security_updates, "apply",
                     host=inputs.get("host") or context.get("host"),
                     dry_run=inputs.get("dry_run", True),
                 )
@@ -1812,3 +1823,32 @@ class DevOpsAgent:
         except Exception as e:
             log.error("Tool execution error", tool=name, error=str(e))
             return {"error": str(e)}
+
+    async def _execute_host_mutation(self, tool, method: str, **kwargs) -> dict:
+        """Approve the whole host operation before any of its commands run."""
+        if not self.auto_apply and not kwargs.get("dry_run", False):
+            # Replay the entire helper, including validation and rollback.
+            # Retain its arguments outside Slack's bounded button value.
+            tool_type = type(tool)
+            # Replay inherits the agent's cwd; imports require the repo root
+            # as the working directory or the packages to be installed.
+            script = (
+                "import asyncio, json, sys; "
+                f"from {tool_type.__module__} import {tool_type.__name__}; "
+                f"result = asyncio.run({tool_type.__name__}().{method}("
+                f"**json.loads({json.dumps(kwargs)!r}))); "
+                "print(json.dumps(result)); "
+                "sys.exit(0 if not (result.get('blocked') or result.get('error')) "
+                "and result.get('success', result.get('applied', False)) is True else 1)"
+            )
+            command = CommandApprovalStore().retain(
+                f"{shlex.quote(sys.executable)} -c {shlex.quote(script)}", host=kwargs.get("host")
+            )
+            return {
+                "blocked": True,
+                "requires_approval": True,
+                "command": command,
+                "approval_payload": base64.b64encode(command.encode()).decode(),
+                "message": f"AUTO_APPLY=false. Approval needed for: `{command}`",
+            }
+        return await getattr(tool, method)(**kwargs)

@@ -602,10 +602,11 @@ async def bitbucket_webhook(
     x_event_key: str = Header(None, alias="X-Event-Key"),
     x_hub_signature_256: str = Header(None),
     x_webhook_signature: str = Header(None, alias="X-Webhook-Signature"),
+    x_hub_signature: str = Header(None, alias="X-Hub-Signature"),
 ):
     """Bitbucket Cloud pull-request events for code review."""
     body = await request.body()
-    _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature)
+    _require_webhook_auth(body, x_hub_signature_256 or x_webhook_signature or x_hub_signature)
     payload = _parse_json_body(body)
     event = (x_event_key or "").lower()
     if event in ("pullrequest:created", "pullrequest:updated"):
