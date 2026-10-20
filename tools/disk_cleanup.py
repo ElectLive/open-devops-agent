@@ -179,8 +179,13 @@ class DiskCleanup:
             else:
                 skipped.append({"path": path, "error": outcome.get("error") or outcome.get("stderr")})
 
+        success = all(result.get("success") is True for result in results) and not any(
+            "error" in item for item in skipped
+        )
+        status = "Cleanup completed." if success else "Cleanup incomplete; a command failed."
         return {
             "applied": True,
+            "success": success,
             "dry_run": False,
             "host": host or "localhost",
             "journal": results,
@@ -189,7 +194,7 @@ class DiskCleanup:
             "alerts": plan["alerts"],
             "alerted": bool(plan["alerts"]),
             "message": (
-                f"Deleted {len(deleted)} stale rotated logs and vacuumed journals. "
+                f"{status} Deleted {len(deleted)} stale rotated logs. "
                 f"{len(plan['alerts'])} protected/unknown path(s) were not touched."
             ),
         }

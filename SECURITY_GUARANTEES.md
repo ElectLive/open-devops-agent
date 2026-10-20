@@ -13,6 +13,7 @@
 **Architecture Security:**
 - No external data exfiltration
 - All operations logged and audited
+- The six host-mutating tools require approval for live changes when `AUTO_APPLY=false`; dry runs remain available.
 - Credentials encrypted at rest
 - API keys never logged
 - RBAC (Role-Based Access Control) enforced
