@@ -82,67 +82,63 @@ class IncidentStore:
         return entries
 
     def apply_retention(self, org_id: str) -> int:
-        """Expire aged payloads while preserving completed-head dedupe evidence."""
+        """Expire payloads while retaining minimal per-attempt authority and fences."""
         if self.retention_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
         month_cutoff = cutoff.replace(day=1)
         deleted = 0
         for category in ("audit", "logs", "checkpoints", "queue", "review_dedupe", "review_claims"):
-            prefix = self.storage.org_prefix(org_id, category)
-            for key in self.storage.list_keys(prefix):
+            for key in self.storage.list_keys(self.storage.org_prefix(org_id, category)):
                 entry = self.storage.get_json(key) if category in ("queue", "review_dedupe", "review_claims") else None
-                legacy_review = category == "queue" and key.startswith(
+                legacy = category == "queue" and key.startswith(
                     self.storage.org_prefix(org_id, "queue", QUEUE_REVIEWS) + "/"
                 )
-                if entry and (entry.get("review_key") or legacy_review or category in ("review_dedupe", "review_claims")):
-                    if entry.get("status") not in (QUEUE_COMPLETED, QUEUE_FAILED):
+                owned = category in ("review_dedupe", "review_claims")
+                failed_review = category == "queue" and entry and entry.get("review_key") and entry.get("status") == QUEUE_FAILED
+                terminal = None
+                if owned or failed_review:
+                    if not entry:
                         continue
-                obj_date, month_granularity = _object_retention_date(self.storage, key, category)
+                    terminal = self.storage.get_json(self.storage.review_release_key(org_id, entry["incident_id"]))
+                    if not terminal:
+                        continue  # Keep an unfinished transition's context and index.
+                elif entry and (legacy or entry.get("review_key")) and entry.get("status") in ("pending", "processing"):
+                    continue
+                if owned and terminal:
+                    ended = "completed_at" if terminal["status"] == QUEUE_COMPLETED else "failed_at"
+                    obj_date, month_granularity = _parse_iso_datetime(terminal.get(ended)), False
+                else:
+                    obj_date, month_granularity = _object_retention_date(self.storage, key, category)
                 if obj_date is None:
                     continue
                 expired = obj_date < month_cutoff if month_granularity else obj_date < cutoff
-                if expired:
-                    shared_head = category == "review_dedupe" or legacy_review
-                    if shared_head and entry.get("status") == QUEUE_FAILED:
-                        continue  # The failure transition owns shared marker release.
-                    if entry and entry.get("status") == QUEUE_COMPLETED and (
-                        category in ("review_dedupe", "review_claims") or legacy_review
-                    ):
-                        minimal = {
-                            "incident_id": entry["incident_id"],
-                            "org_id": org_id,
-                            "status": QUEUE_COMPLETED,
-                            "completed_at": entry["completed_at"],
-                        }
-                        if entry.get("review_key"):
-                            minimal["review_key"] = entry["review_key"]
-                        if category == "review_dedupe" or legacy_review:
-                            claim_key = self.storage.review_claim_key(org_id, entry["incident_id"])
-                            if self.storage.get_json(claim_key) != minimal:
-                                self.storage.put_json(claim_key, minimal)
-                            deleted += int(self.storage.delete(
-                                self.storage.queue_key(org_id, "pending", entry["incident_id"])
-                            ))
-                        if entry != minimal:
-                            self.storage.put_json(key, minimal)
-                        continue
-                    failed_review = (
-                        category == "queue" and entry and entry.get("review_key")
-                        and entry.get("status") == QUEUE_FAILED
-                    )
-                    if failed_review:
-                        marker = self.storage.get_json(entry["review_key"])
-                        if marker and marker["incident_id"] == entry["incident_id"]:
-                            continue  # Preserve evidence and index for worker cleanup.
-                        # Keep terminal evidence until this attempt's cleanup has landed.
-                        incident_id = entry["incident_id"]
-                        for related in (
-                            self.storage.queue_key(org_id, "pending", incident_id),
-                            self.storage.review_claim_key(org_id, incident_id),
-                        ):
-                            deleted += int(self.storage.delete(related))
-                    deleted += int(self.storage.delete(key))
+                if not expired:
+                    continue
+                if legacy and entry["status"] == QUEUE_COMPLETED:
+                    minimal = {"incident_id": entry["incident_id"], "org_id": org_id,
+                               "status": QUEUE_COMPLETED, "completed_at": entry["completed_at"]}
+                    if entry != minimal:
+                        self.storage.put_json(key, minimal)
+                    continue
+                if owned and (category == "review_claims" or terminal["status"] == QUEUE_COMPLETED):
+                    minimal = {"incident_id": entry["incident_id"], "org_id": org_id,
+                               "status": terminal["status"], ended: terminal[ended]}
+                    for field in ("review_key", "review_slot"):
+                        if entry.get(field):
+                            minimal[field] = entry[field]
+                    if category == "review_dedupe":
+                        claim_key = self.storage.review_claim_key(org_id, entry["incident_id"])
+                        if self.storage.get_json(claim_key) != minimal:
+                            self.storage.put_json(claim_key, minimal)
+                    if entry != minimal:
+                        self.storage.put_json(key, minimal)
+                    deleted += int(self.storage.delete(self.storage.queue_key(org_id, "pending", entry["incident_id"])))
+                    continue
+                if owned or failed_review:
+                    # These keys belong to the retired attempt; terminal fences remain.
+                    deleted += int(self.storage.delete(self.storage.queue_key(org_id, "pending", entry["incident_id"])))
+                deleted += int(self.storage.delete(key))
         if deleted:
             log.info("Retention cleanup", org_id=org_id, deleted=deleted)
         return deleted

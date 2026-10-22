@@ -223,12 +223,13 @@ async def lifespan(app: FastAPI):
     global _queue_worker_task, _retention_task, _background_lock_handle, _queue_running
     log.info("DevOps AI Agent starting", auto_apply=os.getenv("AUTO_APPLY", "false"))
     _background_lock_handle = acquire_background_worker_lock()
-    if _background_lock_handle is None:
-        log.info("Queue and retention loops are already running in another process")
-    else:
-        _queue_worker_task = asyncio.create_task(_queue_worker_loop())
-        _retention_task = asyncio.create_task(_retention_loop())
     try:
+        incident_queue.adopt_legacy_reviews()
+        if _background_lock_handle is None:
+            log.info("Queue and retention loops are already running in another process")
+        else:
+            _queue_worker_task = asyncio.create_task(_queue_worker_loop())
+            _retention_task = asyncio.create_task(_retention_loop())
         yield
     finally:
         _queue_running = False

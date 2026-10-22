@@ -933,13 +933,28 @@ class RecordingStorage(MemoryStorage):
 
 class TestReviewQueueDurability:
     @pytest.mark.parametrize("terminal", ["completed", "failed"])
-    def test_idle_poll_reads_do_not_grow_with_history(self, review_context, terminal, capsys):
+    def test_idle_poll_reads_do_not_grow_with_history(self, review_context, terminal, capsys, monkeypatch, bitbucket_request, bitbucket_payload):
         storage = RecordingStorage()
         queue = IncidentQueue(storage)
         counts = []
         previous_size = 0
+        monkeypatch.setenv("ORG_ID", "tenant-configured")
+        monkeypatch.delenv("ORG_IDS", raising=False)
+        monkeypatch.setattr("api.server.incident_queue", queue)
         for size in (100, 1000):
-            for index in range(previous_size, size):
+            payload = deepcopy(bitbucket_payload)
+            payload["pullrequest"]["source"]["commit"]["hash"] = str(previous_size)
+            response = bitbucket_request(payload, org_id="tenant-history")
+            assert response.status_code == 200
+            assert "tenant-history" in queue.list_pending_org_ids()
+            active = queue.claim_next("tenant-history")
+            assert active and active["incident_id"] == response.json()["incident_id"]
+            if terminal == "completed":
+                queue.mark_completed("tenant-history", active["incident_id"], {})
+            else:
+                queue.mark_failed("tenant-history", active["incident_id"], "unavailable")
+            assert "tenant-history" not in queue.list_pending_org_ids()
+            for index in range(previous_size + 1, size):
                 incident_id = queue.enqueue("tenant-history", {**review_context, "head_sha": str(index)})
                 queue.claim_next("tenant-history")
                 if terminal == "completed":
@@ -1014,7 +1029,7 @@ class TestReviewQueueDurability:
             assert claimed["incident_id"] == incident_id
             assert queue.claim_next("tenant") is None
 
-    @pytest.mark.parametrize("stage", ["pending", "marker", "claim", "processing", "terminal", "fence", "delete", "retention_index", "retention_fence", "retention_record", "failed_record", "marker_release"])
+    @pytest.mark.parametrize("stage", ["slot", "pending", "marker", "claim", "processing", "terminal", "fence", "decision", "delete", "retention_index", "retention_fence", "retention_record", "failed_record", "marker_release"])
     @pytest.mark.parametrize("terminal", ["completed", "failed"])
     def test_process_crash_recovers_once(self, review_context, stage, terminal):
         if terminal == "completed" and stage in ("failed_record", "marker_release"):
@@ -1038,6 +1053,8 @@ class TestReviewQueueDurability:
                 def conditional_crash(key, data):
                     result = conditional(key, data)
                     matches = {
+                        "slot": "/review_heads/" in key,
+                        "decision": "/review_releases/" in key,
                         "pending": "/queue/pending/" in key,
                         "marker": "/review_dedupe/" in key,
                         "claim": "/review_claims/" in key,
@@ -1049,7 +1066,7 @@ class TestReviewQueueDurability:
                 def put_crash(key, data):
                     result = put(key, data)
                     if ((stage == "failed_record" and "/queue/failed/" in key)
-                            or (stage == "retention_fence" and terminal == "completed" and "/review_claims/" in key and data.get("status") == "completed")
+                            or (stage == "retention_fence" and "/review_claims/" in key and data.get("status") == terminal and "context" not in data)
                             or (stage == "retention_record" and terminal == "completed" and "/review_dedupe/" in key and "context" not in data)
                             or (stage == "processing" and data.get("status") == "processing")
                             or (stage == "terminal" and "/review_dedupe/" in key and data.get("status") == terminal)
@@ -1063,7 +1080,6 @@ class TestReviewQueueDurability:
                     result = delete(key)
                     if ((stage == "delete" and "/queue/pending/" in key)
                             or (in_retention and stage == "retention_index" and "/queue/pending/" in key)
-                            or (in_retention and stage == "retention_fence" and "/review_claims/" in key)
                             or (stage == "marker_release" and "/review_dedupe/" in key)
                             or (in_retention and stage == "retention_record" and "/queue/failed/" in key)):
                         os._exit(19)
@@ -1089,6 +1105,15 @@ class TestReviewQueueDurability:
                     entry["status"] = terminal
                     entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
                     storage.put_json(record_key, entry)
+                    ended_field = "completed_at" if terminal == "completed" else "failed_at"
+                    decision_key = storage.review_release_key("tenant", incident_id)
+                    decision = storage.get_json(decision_key) or {"incident_id": incident_id, "status": terminal}
+                    decision[ended_field] = entry[ended_field]
+                    storage.put_json(decision_key, decision)
+                    fence_key = storage.review_claim_key("tenant", incident_id)
+                    fence = storage.get_json(fence_key)
+                    fence[ended_field] = entry[ended_field]
+                    storage.put_json(fence_key, fence)
                     store = IncidentStore(storage)
                     store.retention_days = 1
                     in_retention = True
@@ -1103,6 +1128,11 @@ class TestReviewQueueDurability:
             process.join(timeout=15)
             assert process.exitcode == 19
             restarted = IncidentQueue(storage)
+            reserved_id = None
+            if stage == "slot":
+                slots = storage.list_keys("tenant/review_heads/")
+                assert len(slots) == 1
+                reserved_id = storage.get_json(slots[0])["incident_id"]
             if terminal == "failed" and stage == "marker_release":
                 failed_key = storage.list_keys("tenant/queue/failed/")[0]
                 failed = storage.get_json(failed_key)
@@ -1125,9 +1155,11 @@ class TestReviewQueueDurability:
             if stage == "pending":
                 assert claimed_before_retry is not None
             incident_id = restarted.enqueue("tenant", review_context)
+            if stage == "slot":
+                assert incident_id == reserved_id
             assert restarted.enqueue("tenant", review_context) == incident_id
             claimed = claimed_before_retry or restarted.claim_next("tenant")
-            if terminal == "completed" and stage in ("terminal", "fence", "delete", "retention_index", "retention_fence", "retention_record"):
+            if terminal == "completed" and stage in ("terminal", "fence", "decision", "delete", "retention_index", "retention_fence", "retention_record"):
                 assert claimed is None
                 marker = storage.get_json(_review_marker_key(storage, "tenant", incident_id))
                 assert marker["status"] == terminal
@@ -1173,7 +1205,7 @@ class TestReviewQueueDurability:
                         assert queue.claim_next("tenant") is not None
                     if terminal == "completed":
                         queue.mark_completed("tenant", incident_id, {})
-                        for key in (marker_key, storage.review_claim_key("tenant", incident_id)):
+                        for key in (marker_key, storage.review_claim_key("tenant", incident_id), storage.review_release_key("tenant", incident_id)):
                             entry = get(key)
                             entry["completed_at"] = "2020-01-01T00:00:00+00:00"
                             storage.put_json(key, entry)
@@ -1189,6 +1221,9 @@ class TestReviewQueueDurability:
                         assert failed["context"] == review_context
                         failed["failed_at"] = "2020-01-01T00:00:00+00:00"
                         storage.put_json(failed_key, failed)
+                        terminal_record = get(storage.review_release_key("tenant", incident_id))
+                        terminal_record["failed_at"] = failed["failed_at"]
+                        storage.put_json(storage.review_release_key("tenant", incident_id), terminal_record)
                         # A new attempt must survive the old claimant/recovery snapshot.
                         retry_id = queue.enqueue("tenant", review_context)
                         assert retry_id != incident_id
@@ -1198,7 +1233,9 @@ class TestReviewQueueDurability:
                     release.set()
                 assert stale.result(timeout=10) == (None if held == "pending_claim" else 0)
         if terminal == "failed":
-            assert not storage.exists(storage.review_claim_key("tenant", incident_id))
+            fence = storage.get_json(storage.review_claim_key("tenant", incident_id))
+            assert fence and fence["status"] == "failed"
+            assert "context" not in fence
             assert queue.claim_next("tenant")["incident_id"] == retry_id
             queue.mark_completed("tenant", retry_id, {})
         assert storage.list_keys("tenant/queue/pending/") == []
@@ -1269,16 +1306,16 @@ class TestReviewQueueDurability:
                 assert owner.result(timeout=10) == ids[0]
         assert len(set(ids)) == 1
         # Hold the winner's final pending snapshot while a second caller claims.
-        get = storage.get_json
-        marker_key = _review_marker_key(storage, "tenant", ids[0])
+        exists = storage.exists
+        terminal_key = storage.review_release_key("tenant", ids[0])
         snapshot_taken, release_snapshot = threading.Event(), threading.Event()
         owner_thread = None
         counts = {}
 
         def hold_claim_snapshot(key):
             nonlocal owner_thread
-            entry = get(key)
-            if key == marker_key:
+            entry = exists(key)
+            if key == terminal_key:
                 thread = threading.get_ident()
                 if owner_thread is None:
                     owner_thread = thread
@@ -1289,7 +1326,7 @@ class TestReviewQueueDurability:
             return entry
 
         with monkeypatch.context() as injection:
-            injection.setattr(storage, "get_json", hold_claim_snapshot)
+            injection.setattr(storage, "exists", hold_claim_snapshot)
             with ThreadPoolExecutor(max_workers=1) as executor:
                 winner = executor.submit(queue.claim_next, "tenant")
                 try:
@@ -1363,6 +1400,9 @@ def test_retention_cleans_interrupted_terminal_transition(monkeypatch, review_co
     if terminal == "failed":
         storage.put_json(storage.queue_key("tenant", "failed", incident_id), entry)
     storage.put_json(marker_key, entry)
+    if terminal == "completed":
+        storage.put_json_if_absent(storage.review_release_key("tenant", incident_id),
+                                   {"incident_id": incident_id, "status": terminal, "completed_at": entry["completed_at"]})
     deleted = IncidentStore(storage).apply_retention("tenant")
     if terminal == "completed":
         assert deleted == 1
@@ -1375,7 +1415,8 @@ def test_retention_cleans_interrupted_terminal_transition(monkeypatch, review_co
         assert storage.exists(storage.queue_key("tenant", "failed", incident_id))
         assert queue.recover_stale_processing("tenant") == 0
         assert IncidentStore(storage).apply_retention("tenant") == 1
-        assert storage.list_keys("tenant/") == []
+        assert not storage.exists(marker_key)
+        assert storage.get_json(storage.review_claim_key("tenant", incident_id))["status"] == "failed"
     assert storage.list_keys("tenant/queue/pending/") == []
     assert queue.claim_next("tenant") is None
 
@@ -1393,15 +1434,8 @@ def test_gitlab_event_filter_has_positive_control(gitlab_request, gitlab_payload
 def test_legacy_record_replay_requires_published_active_work(monkeypatch, review_context, status):
     storage = MemoryStorage()
     queue = IncidentQueue(storage)
-    incident_id = queue.enqueue("tenant", review_context)
-    marker = storage.get_json(_review_marker_key(storage, "tenant", incident_id))
-    # Match pre-upgrade records, which have no index/reference field.
-    storage._objects.clear()
-    marker_key = marker.pop("review_key")
-    incident_id = marker_key.rsplit("/", 1)[-1].removesuffix(".json")
-    marker["incident_id"] = incident_id
-    marker["status"] = status
-    storage.put_json(storage.queue_key("tenant", "reviews", incident_id), marker)
+    marker, legacy_key = _seed_legacy_review(storage, "tenant", review_context, status)
+    incident_id = marker["incident_id"]
     def fail_index(key, data):
         raise RuntimeError("active index unavailable")
     failure = None
@@ -1416,7 +1450,6 @@ def test_legacy_record_replay_requires_published_active_work(monkeypatch, review
     if status == "pending":
         assert queue.claim_next("tenant")["incident_id"] == incident_id
     elif status == "processing":
-        storage.put_json(storage.review_claim_key("tenant", incident_id), marker)
         assert queue.recover_stale_processing("tenant") == 1
         assert queue.claim_next("tenant")["incident_id"] == incident_id
     else:
@@ -1449,6 +1482,7 @@ def test_retention_aborts_on_s3_fence_head_failure(monkeypatch, review_context):
     entry["failed_at"] = "2020-01-01T00:00:00+00:00"
     storage.put_json(failed_key, entry)
     retry_id = queue.enqueue("tenant", review_context)
+    marker_key = _review_marker_key(storage, "tenant", retry_id)
     retry_marker = storage.get_json(marker_key)
     remove = storage.delete
     fail_head = True
@@ -1456,7 +1490,7 @@ def test_retention_aborts_on_s3_fence_head_failure(monkeypatch, review_context):
     class Client:
         def head_object(self, Bucket, Key):
             assert Bucket == "test-bucket"
-            if fail_head and "/review_claims/" in Key:
+            if fail_head and Key == storage.queue_key("tenant", "pending", incident_id):
                 raise TimeoutError("HEAD unavailable")
             if Key not in storage._objects:
                 raise Exception("404")
@@ -1578,7 +1612,7 @@ class TestReviewFailureRetry:
         assert storage.get_json(marker_key)["status"] == "failed"
         assert queue.enqueue("tenant", review_context) == incident_id
         assert queue.claim_next("tenant") is None
-        # Retry cleanup using persisted failure after the processing fence is gone.
+        # Retry cleanup using persisted failure while the terminal fence stays in place.
         if resume == "transition":
             queue.mark_failed("tenant", incident_id, "review unavailable")
         else:
@@ -1667,7 +1701,7 @@ class TestReviewFailureRetry:
         incident_id = queue.enqueue("tenant", review_context)
         marker_key = queue.claim_next("tenant")["review_key"]
         queue.mark_completed("tenant", incident_id, {})
-        for key in (marker_key, storage.review_claim_key("tenant", incident_id)):
+        for key in (marker_key, storage.review_claim_key("tenant", incident_id), storage.review_release_key("tenant", incident_id)):
             entry = storage.get_json(key)
             entry["completed_at"] = "2020-01-01T00:00:00+00:00"
             storage.put_json(key, entry)
@@ -1827,7 +1861,7 @@ class TestReviewFailureRetry:
             assert queue.claim_next("tenant")["incident_id"] == retry_id
         assert queue.claim_next("tenant") is None
 
-    @pytest.mark.parametrize("cleanup", ["index", "fence"])
+    @pytest.mark.parametrize("cleanup", ["index", "history"])
     def test_failed_history_expiry_preserves_evidence_on_cleanup_error(self, monkeypatch, review_context, cleanup):
         monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
         storage = MemoryStorage()
@@ -1849,7 +1883,7 @@ class TestReviewFailureRetry:
         failed["failed_at"] = "2020-01-01T00:00:00+00:00"
         storage.put_json(failed_key, failed)
         target = (storage.queue_key("tenant", "pending", old_id) if cleanup == "index"
-                  else storage.review_claim_key("tenant", old_id))
+                  else failed_key)
         delete = storage.delete
 
         def fail_cleanup(key):
@@ -1942,15 +1976,12 @@ class TestReviewFailureRetry:
         get = storage.get_json
         taken, release = threading.Event(), threading.Event()
 
-        reads = 0
+        target = storage.review_release_key("tenant", old_id) if phase == "failed_history" else marker_key
         def snapshot(key):
-            nonlocal reads
             entry = get(key)
-            if key == marker_key and entry and entry["incident_id"] == old_id and not taken.is_set():
-                reads += 1
-                if reads == (1 if phase == "failed_history" else 2):
-                    taken.set()
-                    assert release.wait(10)
+            if key == target and not taken.is_set():
+                taken.set()
+                assert release.wait(10)
             return entry
 
         with monkeypatch.context() as injection:
@@ -1962,12 +1993,359 @@ class TestReviewFailureRetry:
                     queue.mark_failed("tenant", old_id, "unavailable")
                     new_id = queue.enqueue("tenant", review_context)
                     assert new_id != old_id
+                    new_marker = _review_marker_key(storage, "tenant", new_id)
                 finally:
                     release.set()
                 retention.result(timeout=10)
-        current = storage.get_json(marker_key) or {}
+        current = storage.get_json(new_marker) or {}
         assert current.get("incident_id") == new_id
         assert queue.enqueue("tenant", review_context) == new_id
         claimed = queue.claim_next("tenant")
         assert claimed and claimed["incident_id"] == new_id
         assert queue.claim_next("tenant") is None
+
+
+class TestReviewFixRoundOne:
+    @pytest.mark.parametrize("snapshot", [1, 2])
+    @pytest.mark.parametrize("new_phase", ["pending", "processing"])
+    def test_stale_failure_cleanup_cannot_change_new_attempt(self, monkeypatch, review_context, snapshot, new_phase):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        old_marker = queue.claim_next("tenant")["review_key"]
+        get = storage.get_json
+        waiting, release = threading.Event(), threading.Event()
+        actor_thread = None
+        reads = 0
+        changed = []
+        put, create, delete = storage.put_json, storage.put_json_if_absent, storage.delete
+
+        def record_mutation(operation, key, *args):
+            if threading.get_ident() == actor_thread:
+                changed.append(key)
+            return operation(key, *args)
+
+        def held_read(key):
+            nonlocal reads
+            entry = get(key)
+            if key == old_marker and threading.get_ident() == actor_thread and entry:
+                reads += 1
+                if reads == snapshot:
+                    waiting.set()
+                    assert release.wait(10)
+            return entry
+
+        def old_actor():
+            nonlocal actor_thread
+            actor_thread = threading.get_ident()
+            queue.mark_failed("tenant", old_id, "unavailable")
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", held_read)
+            injection.setattr(storage, "put_json", lambda key, data: record_mutation(put, key, data))
+            injection.setattr(storage, "put_json_if_absent", lambda key, data: record_mutation(create, key, data))
+            injection.setattr(storage, "delete", lambda key: record_mutation(delete, key))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                stale = executor.submit(old_actor)
+                try:
+                    assert waiting.wait(10)
+                    queue.mark_failed("tenant", old_id, "unavailable")
+                    new_id = queue.enqueue("tenant", review_context)
+                    assert new_id != old_id
+                    new_marker = _review_marker_key(storage, "tenant", new_id)
+                    if new_phase == "processing":
+                        assert queue.claim_next("tenant")["incident_id"] == new_id
+                finally:
+                    release.set()
+                stale.result(timeout=10)
+        marker = storage.get_json(new_marker) or {}
+        preserved = marker.get("incident_id") == new_id
+        third_id = queue.enqueue("tenant", review_context)
+        third_claim = queue.claim_next("tenant")
+        old_failure = storage.get_json(storage.queue_key("tenant", "failed", old_id)) or {}
+        print(f"RACE snapshot={snapshot} new_phase={new_phase} marker_preserved={preserved} "
+              f"third_is_new_attempt={third_id != new_id} third_claimed={third_claim is not None} "
+              f"old_failure_survives={old_failure.get('status') == 'failed'}")
+        assert preserved
+        dependencies = {new_marker, storage.queue_key("tenant", "pending", new_id),
+                        storage.review_claim_key("tenant", new_id),
+                        storage.org_prefix("tenant", "review_releases", f"{new_id}.json")}
+        if marker.get("review_slot"):
+            dependencies.add(marker["review_slot"])
+        assert dependencies.isdisjoint(changed)
+        assert third_id == new_id
+        if new_phase == "pending":
+            assert third_claim and third_claim["incident_id"] == new_id
+        else:
+            assert third_claim is None
+        assert old_failure["status"] == "failed" and old_failure["context"] == review_context
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["pending", "processing", "completed", "failed"])
+    async def test_startup_adopts_only_active_legacy_reviews(self, monkeypatch, tmp_path, review_context, state):
+        import api.server as server
+
+        storage = RecordingStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-adopt", review_context, state)
+        queue = IncidentQueue(storage)
+        monkeypatch.setattr(server, "incident_queue", queue)
+        monkeypatch.setattr(server, "_queue_worker_loop", AsyncMock())
+        monkeypatch.setattr(server, "_retention_loop", AsyncMock())
+        monkeypatch.setenv("BACKGROUND_WORKER_LOCK", str(tmp_path / "worker.lock"))
+        async with server.lifespan(server.app):
+            if state in ("pending", "processing"):
+                recovered = queue.recover_stale_processing("tenant-adopt")
+                if state == "processing":
+                    assert recovered == 1
+                claimed = queue.claim_next("tenant-adopt")
+                assert claimed is not None
+                assert claimed["incident_id"] == entry["incident_id"]
+                assert claimed["context"] == review_context
+                assert claimed["attempts"] == (2 if state == "processing" else 1)
+                queue.mark_completed("tenant-adopt", claimed["incident_id"], {})
+                assert not storage.exists(legacy_key)
+            else:
+                assert queue.claim_next("tenant-adopt") is None
+                assert storage.get_json(legacy_key) == entry
+                assert storage.list_keys("tenant-adopt/review_heads/") == []
+                assert storage.list_keys("tenant-adopt/review_dedupe/") == []
+        startup_scans = storage.listings.count("")
+        assert startup_scans == 1
+        # A repeated lifespan in this process must not repeat adoption's scan.
+        async with server.lifespan(server.app):
+            pass
+        assert storage.listings.count("") == startup_scans
+        storage.reads.clear()
+        queue.list_pending_org_ids()
+        assert queue.recover_stale_processing("tenant-adopt") == 0
+        assert queue.claim_next("tenant-adopt") is None
+        assert storage.reads == []
+
+    @pytest.mark.parametrize("state", ["pending", "processing"])
+    def test_concurrent_adoption_converges_on_one_legacy_attempt(self, monkeypatch, review_context, state):
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-adopt", review_context, state)
+        queues = [IncidentQueue(storage), IncidentQueue(storage)]
+        assert all(callable(getattr(queue, "adopt_legacy_reviews", None)) for queue in queues)
+        get = storage.get_json
+        barrier = threading.Barrier(2)
+        lock = threading.Lock()
+        reads = 0
+
+        def read_together(key):
+            nonlocal reads
+            result = get(key)
+            hold = False
+            if key == legacy_key and result:
+                with lock:
+                    reads += 1
+                    hold = reads <= 2
+            if hold:
+                barrier.wait(timeout=10)
+            return result
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", read_together)
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                results = list(executor.map(lambda queue: queue.adopt_legacy_reviews(), queues))
+        assert all(result >= 0 for result in results)
+        assert len(storage.list_keys("tenant-adopt/queue/pending/")) == 1
+        assert queues[0].adopt_legacy_reviews() == 0
+        queues[0].recover_stale_processing("tenant-adopt")
+        claimed = queues[0].claim_next("tenant-adopt")
+        assert claimed and claimed["incident_id"] == entry["incident_id"]
+        assert queues[1].claim_next("tenant-adopt") is None
+
+    def test_interrupted_adoption_resumes_without_another_attempt(self, monkeypatch, review_context):
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-adopt", review_context, "pending")
+        queue = IncidentQueue(storage)
+        assert callable(getattr(queue, "adopt_legacy_reviews", None))
+        delete = storage.delete
+        def fail_source_delete(key):
+            if key == legacy_key:
+                raise RuntimeError("adoption cleanup unavailable")
+            return delete(key)
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "delete", fail_source_delete)
+            with pytest.raises(RuntimeError, match="adoption cleanup unavailable"):
+                queue.adopt_legacy_reviews()
+        assert storage.exists(legacy_key)
+        pending_key = storage.queue_key("tenant-adopt", "pending", entry["incident_id"])
+        assert (storage.get_json(pending_key) or {}).get("incident_id") == entry["incident_id"]
+        restarted = IncidentQueue(storage)
+        restarted.adopt_legacy_reviews()
+        claimed = restarted.claim_next("tenant-adopt")
+        assert claimed and claimed["incident_id"] == entry["incident_id"]
+        assert restarted.claim_next("tenant-adopt") is None
+        assert not storage.exists(legacy_key)
+
+    def test_processing_legacy_index_failure_preserves_source(self, monkeypatch, review_context):
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-adopt", review_context, "processing")
+        queue = IncidentQueue(storage)
+        create = storage.put_json_if_absent
+        pending_key = storage.queue_key("tenant-adopt", "pending", entry["incident_id"])
+
+        def fail_pending(key, data):
+            if key == pending_key:
+                raise RuntimeError("legacy index unavailable")
+            return create(key, data)
+
+        failure = None
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", fail_pending)
+            try:
+                queue.adopt_legacy_reviews()
+            except RuntimeError as error:
+                failure = error
+        assert storage.get_json(legacy_key) == entry
+        assert failure is not None
+        assert not storage.exists(pending_key)
+        restarted = IncidentQueue(storage)
+        assert restarted.adopt_legacy_reviews() == 1
+        assert restarted.recover_stale_processing("tenant-adopt") == 1
+        claimed = restarted.claim_next("tenant-adopt")
+        assert claimed and claimed["incident_id"] == entry["incident_id"]
+        assert restarted.claim_next("tenant-adopt") is None
+
+    @pytest.mark.parametrize("new_phase", ["pending", "processing"])
+    def test_late_adoption_cannot_clobber_new_attempt(self, monkeypatch, review_context, new_phase):
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-adopt", review_context, "pending")
+        late, active = IncidentQueue(storage), IncidentQueue(storage)
+        assert callable(getattr(late, "adopt_legacy_reviews", None))
+        get = storage.get_json
+        waiting, release = threading.Event(), threading.Event()
+        def held_legacy(key):
+            result = get(key)
+            if key == legacy_key and result and not waiting.is_set():
+                waiting.set()
+                assert release.wait(10)
+            return result
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", held_legacy)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                adoption = executor.submit(late.adopt_legacy_reviews)
+                try:
+                    assert waiting.wait(10)
+                    active.adopt_legacy_reviews()
+                    assert active.claim_next("tenant-adopt")["incident_id"] == entry["incident_id"]
+                    active.mark_failed("tenant-adopt", entry["incident_id"], "unavailable")
+                    new_id = active.enqueue("tenant-adopt", review_context)
+                    assert new_id != entry["incident_id"]
+                    if new_phase == "processing":
+                        assert active.claim_next("tenant-adopt")["incident_id"] == new_id
+                finally:
+                    release.set()
+                adoption.result(timeout=10)
+        assert active.enqueue("tenant-adopt", review_context) == new_id
+        found = active.claim_next("tenant-adopt")
+        if new_phase == "pending":
+            assert found and found["incident_id"] == new_id
+        else:
+            assert found is None
+
+
+    def test_terminal_fences_and_lineage_survive_payload_retention(self, monkeypatch, review_context):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        claimed = queue.claim_next("tenant")
+        snapshot = {**claimed, "status": "pending"}
+        queue.mark_failed("tenant", old_id, "unavailable")
+        release_key = storage.review_release_key("tenant", old_id)
+        fence_key = storage.review_claim_key("tenant", old_id)
+        failed_key = storage.queue_key("tenant", "failed", old_id)
+        for key in (failed_key, fence_key, release_key):
+            entry = storage.get_json(key)
+            entry["failed_at"] = "2020-01-01T00:00:00+00:00"
+            storage.put_json(key, entry)
+        IncidentStore(storage).apply_retention("tenant")
+        assert storage.exists(fence_key)
+        assert "context" not in storage.get_json(fence_key)
+        assert storage.exists(release_key)
+        assert storage.exists(claimed["review_slot"])
+        assert not storage.exists(failed_key)
+        new_id = queue.enqueue("tenant", review_context)
+        assert queue.claim_next("tenant")["incident_id"] == new_id != old_id
+        storage.put_json(storage.queue_key("tenant", "pending", old_id), snapshot)
+        assert queue.claim_next("tenant") is None
+        assert queue.enqueue("tenant", review_context) == new_id
+        assert storage.exists(fence_key)
+
+    def test_completed_legacy_head_dedupes_after_retention(self, monkeypatch, review_context):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-adopt", review_context, "completed")
+        entry["completed_at"] = "2020-01-01T00:00:00+00:00"
+        storage.put_json(legacy_key, entry)
+        queue = IncidentQueue(storage)
+        assert queue.adopt_legacy_reviews() == 0
+        assert storage.get_json(legacy_key) == entry
+        assert queue.enqueue("tenant-adopt", review_context) == entry["incident_id"]
+        IncidentStore(storage).apply_retention("tenant-adopt")
+        assert queue.enqueue("tenant-adopt", review_context) == entry["incident_id"]
+        assert queue.claim_next("tenant-adopt") is None
+        assert "context" not in storage.get_json(legacy_key)
+        assert storage.list_keys("tenant-adopt/review_heads/") == []
+
+    def test_head_lookup_does_not_read_other_review_history(self, review_context):
+        storage = RecordingStorage()
+        queue = IncidentQueue(storage)
+        incident_id = queue.enqueue("tenant", review_context)
+        expected_prefix = storage.org_prefix("tenant", "review_heads") + "/"
+        owned_slot = _review_marker_key(storage, "tenant", incident_id)
+        entry = storage.get_json(owned_slot)
+        head_prefix = entry["review_slot"].rsplit("/", 1)[0] + "/"
+        counts = []
+        for size in (100, 1000):
+            for index in range(size):
+                storage.put_json(expected_prefix + f"other-{index}/00000000000000000000.json",
+                                 {"incident_id": f"other-{index}"})
+            storage.reads.clear()
+            storage.listings.clear()
+            assert queue.enqueue("tenant", review_context) == incident_id
+            counts.append(len(storage.reads))
+            assert storage.listings == [head_prefix]
+            assert all("other-" not in key for key in storage.reads)
+        assert counts[0] == counts[1]
+
+    @pytest.mark.asyncio
+    async def test_failed_adoption_releases_startup_lock(self, monkeypatch, tmp_path):
+        import api.server as server
+        from services.background_lock import acquire_background_worker_lock, release_background_worker_lock
+
+        queue = IncidentQueue(MemoryStorage())
+        assert callable(getattr(queue, "adopt_legacy_reviews", None))
+        def fail_adoption():
+            raise RuntimeError("adoption unavailable")
+        monkeypatch.setattr(queue, "adopt_legacy_reviews", fail_adoption)
+        monkeypatch.setattr(server, "incident_queue", queue)
+        monkeypatch.setenv("BACKGROUND_WORKER_LOCK", str(tmp_path / "worker.lock"))
+        with pytest.raises(RuntimeError, match="adoption unavailable"):
+            async with server.lifespan(server.app):
+                pass
+        lock = acquire_background_worker_lock()
+        try:
+            assert lock is not None
+        finally:
+            release_background_worker_lock(lock)
+
+
+def _seed_legacy_review(storage, org_id, context, state):
+    identity = [org_id, context["scm_platform"], context["repo"], context["change_id"], context["head_sha"]]
+    digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
+    incident_id = "INC-review-" + digest
+    entry = {"incident_id": incident_id, "org_id": org_id, "context": dict(context),
+             "status": state, "created_at": "2026-10-01T00:00:00+00:00",
+             "attempts": 1 if state != "pending" else 0}
+    if state == "processing":
+        entry["claimed_at"] = entry["created_at"]
+        storage.put_json(storage.review_claim_key(org_id, incident_id), entry)
+    if state in ("completed", "failed"):
+        entry["completed_at" if state == "completed" else "failed_at"] = entry["created_at"]
+    legacy_key = storage.queue_key(org_id, "reviews", incident_id)
+    storage.put_json(legacy_key, entry)
+    return entry, legacy_key
