@@ -1271,8 +1271,6 @@ class DevOpsAgent:
             elif issue_type == "cicd":
                 # Determine CI/CD platform
                 platform = get_cicd_platform(context.get("labels", {}), context)
-                if platform == "unknown":
-                    platform = context.get("labels", {}).get("ci") or platform
                 enriched["cicd_platform"] = platform
                 
                 if platform == "github" and context.get("repo") and context.get("run_id"):

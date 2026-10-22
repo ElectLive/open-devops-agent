@@ -9,7 +9,7 @@ from agent.core import DevOpsAgent
 
 CONTEXT = {
     "type": "cicd",
-    "labels": {"ci": "github"},
+    "labels": {"cicd_platform": "github"},
     "repo": "203.0.113.10/org/repo",
     "run_id": 12345,
 }
