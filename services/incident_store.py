@@ -82,7 +82,7 @@ class IncidentStore:
         return entries
 
     def apply_retention(self, org_id: str) -> int:
-        """Expire payloads while retaining minimal per-attempt authority and fences."""
+        """Expire payloads; retain compact legacy and per-attempt terminal evidence."""
         if self.retention_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
@@ -115,12 +115,18 @@ class IncidentStore:
                 expired = obj_date < month_cutoff if month_granularity else obj_date < cutoff
                 if not expired:
                     continue
-                if legacy and entry["status"] == QUEUE_COMPLETED:
+                if legacy and entry["status"] in (QUEUE_COMPLETED, QUEUE_FAILED):
+                    ended = "completed_at" if entry["status"] == QUEUE_COMPLETED else "failed_at"
                     minimal = {"incident_id": entry["incident_id"], "org_id": org_id,
-                               "status": QUEUE_COMPLETED, "completed_at": entry["completed_at"]}
-                    if entry != minimal:
-                        self.storage.put_json(key, minimal)
-                    continue
+                               "status": entry["status"], ended: entry[ended]}
+                    claim_key = self.storage.review_claim_key(org_id, entry["incident_id"])
+                    # Preserve terminal authority until its claim payload is compacted.
+                    if self.storage.get_json(claim_key) != minimal:
+                        self.storage.put_json(claim_key, minimal)
+                    if entry["status"] == QUEUE_COMPLETED:
+                        if entry != minimal:
+                            self.storage.put_json(key, minimal)
+                        continue
                 if owned and (category == "review_claims" or terminal["status"] == QUEUE_COMPLETED):
                     minimal = {"incident_id": entry["incident_id"], "org_id": org_id,
                                "status": terminal["status"], ended: terminal[ended]}

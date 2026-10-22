@@ -6,10 +6,12 @@ import hmac
 import json
 import os
 import multiprocessing
+import runpy
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -2275,6 +2277,60 @@ class TestReviewFixRoundOne:
         assert queue.enqueue("tenant", review_context) == new_id
         assert storage.exists(fence_key)
 
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    def test_legacy_lifecycle_claim_payload_expires_after_two_retention_passes(self, monkeypatch, review_context, terminal):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-legacy", review_context, terminal)
+        incident_id = entry["incident_id"]
+        claim_key = storage.review_claim_key("tenant-legacy", incident_id)
+        claim = storage.get_json(claim_key)
+        assert claim["status"] == "processing" and claim["context"] == review_context
+        assert IncidentQueue(storage).adopt_legacy_reviews() == 0
+        ended = "completed_at" if terminal == "completed" else "failed_at"
+        minimal = {"incident_id": incident_id, "org_id": "tenant-legacy", "status": terminal,
+                   ended: "2020-01-01T00:00:00+00:00"}
+        store = IncidentStore(storage)
+        for pass_number in (1, 2):
+            store.apply_retention("tenant-legacy")
+            claim = storage.get_json(claim_key)
+            print(f"LEGACY terminal={terminal} pass={pass_number} claim_status={claim.get('status')} "
+                  f"claim_has_context={'context' in claim} legacy_exists={storage.exists(legacy_key)}")
+            assert "context" not in claim
+            assert claim == minimal
+            if terminal == "completed":
+                assert storage.get_json(legacy_key) == minimal
+            else:
+                assert not storage.exists(legacy_key)
+
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    def test_legacy_claim_compaction_failure_preserves_terminal_source(self, monkeypatch, review_context, terminal):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        entry, legacy_key = _seed_legacy_review(storage, "tenant-legacy", review_context, terminal)
+        claim_key = storage.review_claim_key("tenant-legacy", entry["incident_id"])
+        put = storage.put_json
+        failure = None
+
+        def fail_claim_compaction(key, data):
+            if key == claim_key and "context" not in data:
+                raise RuntimeError("legacy claim unavailable")
+            return put(key, data)
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json", fail_claim_compaction)
+            try:
+                IncidentStore(storage).apply_retention("tenant-legacy")
+            except RuntimeError as error:
+                failure = error
+        assert storage.get_json(legacy_key) == entry
+        assert failure is not None
+        assert storage.get_json(claim_key)["context"] == review_context
+        for _ in range(2):
+            IncidentStore(storage).apply_retention("tenant-legacy")
+            claim = storage.get_json(claim_key)
+            assert "context" not in claim and claim["status"] == terminal
+
     def test_completed_legacy_head_dedupes_after_retention(self, monkeypatch, review_context):
         monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
         storage = MemoryStorage()
@@ -2335,17 +2391,22 @@ class TestReviewFixRoundOne:
 
 
 def _seed_legacy_review(storage, org_id, context, state):
-    identity = [org_id, context["scm_platform"], context["repo"], context["change_id"], context["head_sha"]]
-    digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
-    incident_id = "INC-review-" + digest
-    entry = {"incident_id": incident_id, "org_id": org_id, "context": dict(context),
-             "status": state, "created_at": "2026-10-01T00:00:00+00:00",
-             "attempts": 1 if state != "pending" else 0}
-    if state == "processing":
-        entry["claimed_at"] = entry["created_at"]
-        storage.put_json(storage.review_claim_key(org_id, incident_id), entry)
-    if state in ("completed", "failed"):
-        entry["completed_at" if state == "completed" else "failed_at"] = entry["created_at"]
+    # Run the unmodified base queue so fixtures retain every lifecycle artifact.
+    queue_class = runpy.run_path(str(Path(__file__).parent / "fixtures" / "incident_queue_c3bbc901.py"))["IncidentQueue"]
+    queue = queue_class(storage)
+    incident_id = queue.enqueue(org_id, context)
+    if state != "pending":
+        assert queue.claim_next(org_id)["incident_id"] == incident_id
+    if state == "completed":
+        queue.mark_completed(org_id, incident_id, {})
+    elif state == "failed":
+        queue.mark_failed(org_id, incident_id, "unavailable")
     legacy_key = storage.queue_key(org_id, "reviews", incident_id)
-    storage.put_json(legacy_key, entry)
-    return entry, legacy_key
+    for key in (legacy_key, storage.review_claim_key(org_id, incident_id)):
+        entry = storage.get_json(key)
+        if entry:
+            for field in ("created_at", "claimed_at", "completed_at", "failed_at"):
+                if field in entry:
+                    entry[field] = "2020-01-01T00:00:00+00:00"
+            storage.put_json(key, entry)
+    return storage.get_json(legacy_key), legacy_key
