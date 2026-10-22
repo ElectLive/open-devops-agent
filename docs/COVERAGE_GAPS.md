@@ -200,7 +200,7 @@ For apply: agent uses **suggest_fix** with exact `terraform apply` steps for hum
 | Area | Strategy |
 |------|----------|
 | DNS (Route53, Cloudflare) | Manual webhook + runbook + suggest_fix |
-| SSL/cert renewal prerequisites (missing certbot or invalid DNS plugin setup) | Built-in `renew_certificates` defaults to `dry_run=true` and supports DNS-01/wildcard via `CERTBOT_DNS_PLUGIN`; missing certbot or invalid DNS plugin configuration is reported as a failure. |
+| SSL/cert renewal prerequisites (missing certbot or invalid DNS plugin setup) | Built-in `renew_certificates` defaults to `dry_run=true` and supports DNS-01/wildcard via `CERTBOT_DNS_PLUGIN`; renewal is refused for missing certbot, an invalid domain, an unknown plugin name, or an unset `CERTBOT_DNS_CREDENTIALS` required by the selected plugin; a failed DNS-01/wildcard renewal is reported as a runtime failure. |
 | Vault/secrets rotation | Runbook + escalate |
 | Helm uninstall | Blocked — rollback or manual |
 | Terraform apply | suggest_fix + human apply |
