@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -410,3 +411,975 @@ class TestBitbucketWebhookSignature:
             headers={empty_header: "", fallback: signature},
         )
         assert response.status_code == 200
+
+
+@pytest.fixture
+def bitbucket_request(monkeypatch):
+    from api.server import app
+
+    signing_key = os.urandom(32)
+    monkeypatch.setenv("WEBHOOK_SECRET", signing_key.hex())
+
+    def post(
+        payload,
+        event="pullrequest:created",
+        org_id="tenant-ember",
+        raise_server_exceptions=True,
+    ):
+        body = json.dumps(payload).encode()
+        signature = "sha256=" + hmac.new(
+            signing_key.hex().encode(), body, hashlib.sha256
+        ).hexdigest()
+        headers = {"X-Hub-Signature-256": signature, "X-Org-ID": org_id}
+        if event is not None:
+            headers["X-Event-Key"] = event
+        return TestClient(app, raise_server_exceptions=raise_server_exceptions).post(
+            "/webhook/bitbucket", content=body, headers=headers
+        )
+
+    return post
+
+
+
+@pytest.fixture
+def bitbucket_payload():
+    return {
+        "repository": {
+            "workspace": {"slug": "workspace-cedar"},
+            "slug": "repository-maple",
+        },
+        "pullrequest": {
+            "id": 731,
+            "state": "OPEN",
+            "title": "Review this change",
+            "source": {
+                "branch": {"name": "feature"},
+                "commit": {"hash": "commit-juniper"},
+            },
+            "destination": {"branch": {"name": "main"}},
+        },
+    }
+
+
+
+@pytest.fixture
+def review_queue(monkeypatch):
+    queue = IncidentQueue(MemoryStorage())
+    monkeypatch.setattr("api.server.incident_queue", queue)
+    return queue
+
+
+
+
+@pytest.fixture
+def review_context():
+    return {
+        "type": "code_review",
+        "scm_platform": "bitbucket",
+        "repo": "workspace-cedar/repository-maple",
+        "change_id": "731",
+        "head_sha": "commit-juniper",
+    }
+
+
+
+@pytest.fixture
+def gitlab_request(monkeypatch):
+    from api.server import app
+
+    signing_key = os.urandom(32).hex()
+    monkeypatch.setenv("WEBHOOK_SECRET", signing_key)
+
+    def post(payload, event="Merge Request Hook", org_id="tenant-ash", static_token=False):
+        body = json.dumps(payload).encode()
+        headers = {"X-Org-ID": org_id}
+        if event is not None:
+            headers["X-Gitlab-Event"] = event
+        if static_token:
+            headers["X-Gitlab-Token"] = signing_key
+        else:
+            headers["X-Hub-Signature-256"] = "sha256=" + hmac.new(
+                signing_key.encode(), body, hashlib.sha256
+            ).hexdigest()
+        return TestClient(app).post("/webhook/gitlab", content=body, headers=headers)
+
+    return post
+
+
+
+@pytest.fixture
+def gitlab_payload():
+    return {
+        "object_kind": "merge_request",
+        "project": {"id": 482, "path_with_namespace": "group-oak/repository-pine"},
+        "user": {"username": "reviewer"},
+        "object_attributes": {
+            "iid": 953,
+            "action": "open",
+            "state": "opened",
+            "title": "Review the merge request",
+            "source_branch": "feature",
+            "target_branch": "main",
+            "last_commit": {"id": "commit-willow"},
+        },
+    }
+
+
+
+class TestGitlabReviewTriggers:
+    @pytest.mark.parametrize("action", ["update", "approval", "approved", "unapproval", "unapproved", "close", "merge", ""])
+    def test_ignores_actions_without_new_review_work(
+        self, gitlab_request, gitlab_payload, action
+    ):
+        gitlab_payload["object_attributes"]["action"] = action
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            response = gitlab_request(gitlab_payload)
+            assert response.status_code == 200
+            assert response.json()["status"] == "ignored"
+            assert enqueue.call_count == 0
+
+            gitlab_payload["object_attributes"]["action"] = "open"
+            positive = gitlab_request(gitlab_payload)
+            assert positive.status_code == 200
+            assert positive.json()["status"] == "queued"
+            assert enqueue.call_count == 1
+
+
+    @pytest.mark.parametrize("action", ["open", "reopen", "update"])
+    @pytest.mark.parametrize("event", ["Merge Request Hook", None])
+    def test_ready_actions_record_head_and_preserve_draft_guards(
+        self, gitlab_request, gitlab_payload, action, event
+    ):
+        attrs = gitlab_payload["object_attributes"]
+        attrs["action"] = action
+        if action == "update":
+            attrs["oldrev"] = "commit-previous"
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            for field in ("draft", "work_in_progress"):
+                draft = deepcopy(gitlab_payload)
+                draft["object_attributes"][field] = True
+                response = gitlab_request(draft, event)
+                assert response.status_code == 200
+                assert response.json()["status"] == "ignored"
+                assert enqueue.call_count == 0
+
+            response = gitlab_request(gitlab_payload, event)
+            assert response.status_code == 200
+            assert response.json() == {
+                "status": "queued",
+                "type": "code_review",
+                "incident_id": "INC-review",
+            }
+            assert enqueue.call_count == 1
+            context = enqueue.call_args.args[0]
+            assert context.get("head_sha") == "commit-willow"
+            assert context["type"] == "code_review"
+            assert context["scm_platform"] == "gitlab"
+            assert context["repo"] == "482"
+            assert context["change_id"] == "953"
+
+
+    @pytest.mark.parametrize("state", ["pending", "processing", "completed", "failed"])
+    def test_duplicate_head_returns_original_response_across_states(
+        self, gitlab_request, gitlab_payload, review_queue, state
+    ):
+        first = gitlab_request(gitlab_payload)
+        assert first.status_code == 200
+        incident_id = first.json()["incident_id"]
+        if state != "pending":
+            assert review_queue.claim_next("tenant-ash")["incident_id"] == incident_id
+        if state == "completed":
+            review_queue.mark_completed("tenant-ash", incident_id, {})
+        elif state == "failed":
+            review_queue.mark_failed("tenant-ash", incident_id, "review unavailable")
+        gitlab_payload["object_attributes"].update(
+            action="update", oldrev="commit-before", title="Edited title"
+        )
+        repeat = gitlab_request(gitlab_payload)
+        assert repeat.status_code == 200
+        assert repeat.json() == {
+            "status": "queued",
+            "type": "code_review",
+            "incident_id": incident_id,
+        }
+        keys = review_queue.storage.list_keys("tenant-ash/review_dedupe/")
+        assert len(keys) == 1
+        entry = review_queue.storage.get_json(keys[0])
+        assert entry["status"] == state
+        org = entry["org_id"]
+        active_keys = review_queue.storage.list_keys(f"{org}/queue/pending/")
+        assert len(active_keys) == (0 if state in ("completed", "failed") else 1)
+        assert entry["context"].get("head_sha") == "commit-willow"
+
+
+    @pytest.mark.parametrize("field", ["org_id", "head_sha", "repo", "change_id"])
+    def test_distinct_identity_creates_new_review(
+        self, gitlab_request, gitlab_payload, review_queue, field
+    ):
+        first = gitlab_request(gitlab_payload)
+        repeat = gitlab_request(gitlab_payload)
+        assert first.status_code == repeat.status_code == 200
+        assert repeat.json() == first.json()
+        gitlab_payload["object_attributes"].update(action="update", oldrev="commit-before")
+        org_id = "tenant-ash"
+        if field == "org_id":
+            org_id = "tenant-elm"
+        elif field == "head_sha":
+            gitlab_payload["object_attributes"]["last_commit"]["id"] = "commit-poplar"
+        elif field == "repo":
+            gitlab_payload["project"]["id"] = 674
+        else:
+            gitlab_payload["object_attributes"]["iid"] = 816
+        second = gitlab_request(gitlab_payload, org_id=org_id)
+        second_repeat = gitlab_request(gitlab_payload, org_id=org_id)
+        assert second.status_code == second_repeat.status_code == 200
+        assert second.json() == second_repeat.json()
+        assert second.json()["incident_id"] != first.json()["incident_id"]
+        keys = [key for key in review_queue.storage.list_keys("") if "/review_dedupe/" in key]
+        assert len(keys) == 2
+        assert {review_queue.storage.get_json(key)["org_id"] for key in keys} == {
+            "tenant-ash",
+            org_id,
+        }
+
+
+    @pytest.mark.parametrize("delimiter", [":", '\",\"'])
+    def test_identity_field_boundaries_do_not_collide(
+        self, gitlab_request, gitlab_payload, review_queue, delimiter
+    ):
+        del gitlab_payload["project"]["id"]
+        gitlab_payload["project"]["path_with_namespace"] = f"group-oak{delimiter}842"
+        first = gitlab_request(gitlab_payload)
+        repeat = gitlab_request(gitlab_payload)
+        assert first.status_code == repeat.status_code == 200
+        assert repeat.json() == first.json()
+        # Moving a delimiter across adjacent fields must form a different identity.
+        gitlab_payload["project"]["path_with_namespace"] = "group-oak"
+        gitlab_payload["object_attributes"]["iid"] = f"842{delimiter}953"
+        second = gitlab_request(gitlab_payload)
+        second_repeat = gitlab_request(gitlab_payload)
+        assert second.status_code == second_repeat.status_code == 200
+        assert second_repeat.json() == second.json()
+        assert second.json()["incident_id"] != first.json()["incident_id"]
+        assert len(review_queue.storage.list_keys("tenant-ash/review_dedupe/")) == 2
+
+
+    @pytest.mark.parametrize("committed", [False, True])
+    def test_write_error_succeeds_only_when_record_persisted(
+        self, monkeypatch, gitlab_request, gitlab_payload, review_queue, committed
+    ):
+        storage = review_queue.storage
+        put = storage.put_json_if_absent
+
+        def lose_acknowledgement(key, data):
+            if "/review_dedupe/" not in key:
+                return put(key, data)
+            if committed:
+                put(key, data)
+            raise RuntimeError("Review write unavailable")
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", lose_acknowledgement)
+            if committed:
+                response = gitlab_request(gitlab_payload)
+                assert response.status_code == 200
+                keys = storage.list_keys("tenant-ash/review_dedupe/")
+                assert len(keys) == 1
+                entry = storage.get_json(keys[0])
+                assert entry["context"].get("head_sha") == "commit-willow"
+                assert response.json() == {
+                    "status": "queued",
+                    "type": "code_review",
+                    "incident_id": entry["incident_id"],
+                }
+            else:
+                failure = None
+                try:
+                    gitlab_request(gitlab_payload)
+                except RuntimeError as error:
+                    failure = error
+                assert failure is not None
+                assert str(failure) == "Review write unavailable"
+                assert storage.list_keys("tenant-ash/review_dedupe/") == []
+
+        retry = gitlab_request(gitlab_payload)
+        assert retry.status_code == 200
+        keys = storage.list_keys("tenant-ash/review_dedupe/")
+        assert len(keys) == 1
+        assert retry.json()["incident_id"] == storage.get_json(keys[0])["incident_id"]
+        if committed:
+            assert retry.json() == response.json()
+
+
+    def test_static_token_review_and_failed_pipeline(
+        self, gitlab_request, gitlab_payload, review_queue
+    ):
+        review = gitlab_request(gitlab_payload, static_token=True)
+        assert review.status_code == 200
+        keys = review_queue.storage.list_keys("tenant-ash/review_dedupe/")
+        assert len(keys) == 1
+        entry = review_queue.storage.get_json(keys[0])
+        assert entry["context"].get("head_sha") == "commit-willow"
+        pipeline = {
+            "object_kind": "pipeline",
+            "project": {"id": 482},
+            "object_attributes": {"id": 617, "status": "failed"},
+        }
+        response = gitlab_request(pipeline, event=None)
+        assert response.status_code == 200
+        assert response.json()["status"] == "queued"
+        assert response.json()["type"] == "cicd"
+        keys = [key for key in review_queue.storage.list_keys("tenant-ash/queue/pending/")
+                if review_queue.storage.get_json(key)["context"]["type"] == "cicd"]
+        assert len(keys) == 1
+        assert review_queue.storage.get_json(keys[0])["context"] == {
+            "type": "cicd",
+            "source": "gitlab_ci",
+            "org_id": "tenant-ash",
+            "project_id": "482",
+            "pipeline_id": 617,
+            "labels": {"cicd_platform": "gitlab"},
+        }
+
+
+
+class TestBitbucketReviewTriggers:
+    @pytest.mark.parametrize(
+        "event",
+        [
+            "pullrequest:comment_created",
+            "pullrequest:fulfilled",
+            "pullrequest:rejected",
+            None,
+        ],
+    )
+    def test_ignores_non_review_events(self, bitbucket_request, bitbucket_payload, event):
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            response = bitbucket_request(bitbucket_payload, event)
+            assert response.status_code == 200
+            assert response.json()["status"] == "ignored"
+            assert enqueue.call_count == 0
+
+            response = bitbucket_request(bitbucket_payload)
+            assert response.status_code == 200
+            assert response.json()["status"] == "queued"
+            assert enqueue.call_count == 1
+
+
+    @pytest.mark.parametrize("event", ["pullrequest:created", "pullrequest:updated"])
+    def test_reviews_only_ready_prs_and_records_head(
+        self, bitbucket_request, bitbucket_payload, event
+    ):
+        with patch(
+            "api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")
+        ) as enqueue:
+            for draft in ({"draft": True}, {"state": "DRAFT"}, {"state": "MERGED"}, {"state": "DECLINED"}, {"state": ""}):
+                payload = dict(bitbucket_payload)
+                payload["pullrequest"] = {**bitbucket_payload["pullrequest"], **draft}
+                response = bitbucket_request(payload, event)
+                assert response.status_code == 200
+                assert response.json()["status"] == "ignored"
+                assert enqueue.call_count == 0
+
+            response = bitbucket_request(bitbucket_payload, event)
+            assert response.status_code == 200
+            assert response.json()["status"] == "queued"
+            assert response.json()["type"] == "code_review"
+            assert enqueue.call_count == 1
+            context = enqueue.call_args.args[0]
+            assert context.get("head_sha") == "commit-juniper"
+            assert context["type"] == "code_review"
+
+
+    @pytest.mark.parametrize("state", ["pending", "processing", "completed", "failed"])
+    def test_duplicate_head_across_queue_states(
+        self, bitbucket_request, bitbucket_payload, review_queue, state
+    ):
+        first = bitbucket_request(bitbucket_payload)
+        assert first.status_code == 200
+        assert first.json()["status"] == "queued"
+        incident_id = first.json()["incident_id"]
+        if state != "pending":
+            entry = review_queue.claim_next("tenant-ember")
+            assert entry["incident_id"] == incident_id
+        if state == "completed":
+            review_queue.mark_completed("tenant-ember", incident_id, {})
+        elif state == "failed":
+            review_queue.mark_failed("tenant-ember", incident_id, "review unavailable")
+
+        bitbucket_payload["pullrequest"]["title"] = "Edited review title"
+        repeat = bitbucket_request(bitbucket_payload, "pullrequest:updated")
+        assert repeat.status_code == 200
+        keys = review_queue.storage.list_keys("tenant-ember/review_dedupe/")
+        assert len(keys) == 1
+        entry = review_queue.storage.get_json(keys[0])
+        assert entry["status"] == state
+        org = entry["org_id"]
+        active_keys = review_queue.storage.list_keys(f"{org}/queue/pending/")
+        assert len(active_keys) == (0 if state in ("completed", "failed") else 1)
+        assert entry["context"].get("head_sha") == "commit-juniper"
+
+
+    @pytest.mark.parametrize("field", ["org_id", "repo", "change_id", "head_sha"])
+    def test_distinct_review_identity_enqueues_separately(
+        self, bitbucket_request, bitbucket_payload, review_queue, field
+    ):
+        first = bitbucket_request(bitbucket_payload)
+        bitbucket_request(bitbucket_payload)
+        assert len(review_queue.storage.list_keys("tenant-ember/review_dedupe/")) == 1
+
+        org_id = "tenant-ember"
+        if field == "org_id":
+            org_id = "tenant-birch"
+        elif field == "repo":
+            bitbucket_payload["repository"]["slug"] = "repository-willow"
+        elif field == "change_id":
+            bitbucket_payload["pullrequest"]["id"] = 845
+        else:
+            bitbucket_payload["pullrequest"]["source"]["commit"]["hash"] = "commit-spruce"
+        second = bitbucket_request(bitbucket_payload, "pullrequest:updated", org_id)
+        assert first.status_code == second.status_code == 200
+        assert second.json()["status"] == "queued"
+        assert first.json()["incident_id"] != second.json()["incident_id"]
+        bitbucket_request(bitbucket_payload, "pullrequest:updated", org_id)
+        keys = [key for key in review_queue.storage.list_keys("") if "/review_dedupe/" in key]
+        assert len(keys) == 2
+        assert {review_queue.storage.get_json(key)["org_id"] for key in keys} == {
+            "tenant-ember",
+            org_id,
+        }
+
+
+    def test_concurrent_duplicate_deliveries_enqueue_once(
+        self, bitbucket_request, bitbucket_payload, review_queue
+    ):
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            responses = list(
+                executor.map(lambda _: bitbucket_request(bitbucket_payload), range(8))
+            )
+        assert all(response.status_code == 200 for response in responses)
+        assert len(review_queue.storage.list_keys("tenant-ember/review_dedupe/")) == 1
+
+
+    def test_shared_dedupe_includes_provider(self, review_queue):
+        context = {
+            "type": "code_review",
+            "scm_platform": "bitbucket",
+            "repo": "workspace-cedar/repository-maple",
+            "change_id": "731",
+            "head_sha": "commit-juniper",
+        }
+        first = review_queue.enqueue("tenant-ember", context)
+        review_queue.enqueue("tenant-ember", context)
+        assert len(review_queue.storage.list_keys("tenant-ember/review_dedupe/")) == 1
+        second = review_queue.enqueue("tenant-ember", {**context, "scm_platform": "gitlab"})
+        assert first != second
+        assert len(review_queue.storage.list_keys("tenant-ember/review_dedupe/")) == 2
+
+
+
+class RecordingStorage(MemoryStorage):
+    """Use real storage semantics; record every listing and object read."""
+
+    def __init__(self):
+        super().__init__()
+        self.reads = []
+        self.listings = []
+
+    def get_json(self, key):
+        self.reads.append(key)
+        return super().get_json(key)
+
+    def list_keys(self, prefix):
+        self.listings.append(prefix)
+        return super().list_keys(prefix)
+
+
+class TestReviewQueueDurability:
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    def test_idle_poll_reads_do_not_grow_with_history(self, review_context, terminal, capsys):
+        storage = RecordingStorage()
+        queue = IncidentQueue(storage)
+        counts = []
+        for size in (100, 1000):
+            for index in range(len(storage.list_keys("tenant-history/review_dedupe/")), size):
+                incident_id = queue.enqueue("tenant-history", {**review_context, "head_sha": str(index)})
+                queue.claim_next("tenant-history")
+                if terminal == "completed":
+                    queue.mark_completed("tenant-history", incident_id, {})
+                else:
+                    queue.mark_failed("tenant-history", incident_id, "unavailable")
+            for index in range(size):
+                storage.put_json(storage.queue_key("tenant-history", "reviews", f"legacy-{index}"),
+                                 {"status": terminal, "incident_id": f"legacy-{index}"})
+            storage.reads.clear()
+            storage.listings.clear()
+            queue.list_pending_org_ids()
+            assert queue.recover_stale_processing("tenant-history") == 0
+            assert queue.claim_next("tenant-history") is None
+            counts.append((len(storage.reads), len(storage.listings)))
+            assert storage.list_keys("tenant-history/queue/pending/") == []
+            assert storage.list_keys("tenant-history/queue/processing/") == []
+        assert counts == [(0, 4), (0, 4)]
+        capsys.readouterr()
+        print(f"history=100,1000 terminal={terminal} poll (get_json,list_keys)={counts}")
+
+    @pytest.mark.parametrize("stage", ["pending", "marker"])
+    @pytest.mark.parametrize("committed", [False, True])
+    @pytest.mark.parametrize("advanced", ["pending", "processing", "completed", "failed"])
+    def test_lost_write_ack_across_lifecycle(self, monkeypatch, review_context, stage, committed, advanced):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        original = storage.put_json_if_absent
+        fired = False
+
+        def write(key, data):
+            nonlocal fired
+            matches = "/queue/pending/" in key if stage == "pending" else "/review_dedupe/" in key
+            if not matches or fired:
+                return original(key, data)
+            fired = True
+            if committed:
+                original(key, data)
+                if advanced != "pending":
+                    claimed = queue.claim_next("tenant")
+                    assert claimed is not None
+                    if advanced == "completed":
+                        queue.mark_completed("tenant", claimed["incident_id"], {})
+                    elif advanced == "failed":
+                        queue.mark_failed("tenant", claimed["incident_id"], "unavailable")
+            raise RuntimeError("lost write acknowledgement")
+
+        failure = None
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", write)
+            try:
+                queue.enqueue("tenant", review_context)
+            except RuntimeError as error:
+                failure = error
+        assert fired
+        if committed and (stage == "marker" or advanced != "pending"):
+            assert failure is None
+        if not committed:
+            assert failure is not None
+            assert str(failure) == "lost write acknowledgement"
+        incident_id = queue.enqueue("tenant", review_context)
+        assert queue.enqueue("tenant", review_context) == incident_id
+        if committed and advanced != "pending":
+            assert queue.claim_next("tenant") is None
+        else:
+            claimed = queue.claim_next("tenant")
+            assert claimed is not None
+            assert claimed["incident_id"] == incident_id
+            assert queue.claim_next("tenant") is None
+
+    @pytest.mark.parametrize("stage", ["pending", "marker", "claim", "processing", "terminal", "fence", "delete", "retention_index", "retention_fence", "retention_marker"])
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    def test_process_crash_recovers_once(self, review_context, stage, terminal):
+        # A real exit bypasses all enqueue/claim/terminal exception handlers.
+        if "fork" not in multiprocessing.get_all_start_methods():
+            pytest.skip("fork required to share the recording memory backend")
+        ctx = multiprocessing.get_context("fork")
+        with ctx.Manager() as manager:
+            storage = MemoryStorage()
+            storage._objects = manager.dict()
+            storage._lock = ctx.Lock()
+            # DictProxy iteration returns an iterator proxy unavailable after fork.
+            storage.list_keys = lambda prefix: sorted(key for key in storage._objects.keys() if key.startswith(prefix))
+
+            def child():
+                queue = IncidentQueue(storage)
+                conditional, put, delete = storage.put_json_if_absent, storage.put_json, storage.delete
+
+                def conditional_crash(key, data):
+                    result = conditional(key, data)
+                    matches = {
+                        "pending": "/queue/pending/" in key,
+                        "marker": "/review_dedupe/" in key,
+                        "claim": "/review_claims/" in key,
+                    }
+                    if matches.get(stage):
+                        os._exit(19)
+                    return result
+
+                def put_crash(key, data):
+                    result = put(key, data)
+                    if ((stage == "processing" and data.get("status") == "processing")
+                            or (stage == "terminal" and "/review_dedupe/" in key and data.get("status") == terminal)
+                            or (stage == "fence" and "/review_claims/" in key and data.get("status") == terminal)):
+                        os._exit(19)
+                    return result
+
+                def delete_crash(key):
+                    result = delete(key)
+                    if ((stage in ("delete", "retention_index") and "/queue/pending/" in key)
+                            or (stage == "retention_fence" and "/review_claims/" in key)
+                            or (stage == "retention_marker" and "/review_dedupe/" in key)):
+                        os._exit(19)
+                    return result
+
+                storage.put_json_if_absent = conditional_crash
+                storage.put_json = put_crash
+                storage.delete = delete_crash
+                incident_id = queue.enqueue("tenant", review_context)
+                assert queue.claim_next("tenant") is not None
+                if stage.startswith("retention_"):
+                    marker_key = storage.review_dedupe_key("tenant", incident_id)
+                    entry = storage.get_json(marker_key)
+                    entry["status"] = terminal
+                    entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
+                    storage.put_json(marker_key, entry)
+                    store = IncidentStore(storage)
+                    store.retention_days = 1
+                    store.apply_retention("tenant")
+                elif terminal == "completed":
+                    queue.mark_completed("tenant", incident_id, {})
+                else:
+                    queue.mark_failed("tenant", incident_id, "unavailable")
+
+            process = ctx.Process(target=child)
+            process.start()
+            process.join(timeout=15)
+            assert process.exitcode == 19
+            restarted = IncidentQueue(storage)
+            recovered = restarted.recover_stale_processing("tenant")
+            if stage in ("claim", "processing"):
+                assert recovered == 1
+            else:
+                assert recovered == 0
+            claimed_before_retry = restarted.claim_next("tenant") if stage == "pending" else None
+            if stage == "pending":
+                assert claimed_before_retry is not None
+            incident_id = restarted.enqueue("tenant", review_context)
+            assert restarted.enqueue("tenant", review_context) == incident_id
+            claimed = claimed_before_retry or restarted.claim_next("tenant")
+            if stage in ("terminal", "fence", "delete", "retention_index", "retention_fence"):
+                assert claimed is None
+                marker = storage.get_json(storage.review_dedupe_key("tenant", incident_id))
+                assert marker["status"] == terminal
+                assert marker["context"] == review_context
+                assert storage.list_keys("tenant/queue/") == []
+            else:
+                assert claimed is not None
+                assert claimed["incident_id"] == incident_id
+                assert claimed["attempts"] == (2 if stage in ("claim", "processing") else 1)
+                restarted.mark_completed("tenant", incident_id, {})
+            assert restarted.claim_next("tenant") is None
+
+    @pytest.mark.parametrize("terminal", ["completed", "failed"])
+    @pytest.mark.parametrize("held", ["pending_claim", "processing_recovery"])
+    def test_retention_expires_terminal_records_preserves_active_work(self, monkeypatch, review_context, terminal, held):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        incident_id = queue.enqueue("tenant", review_context)
+        marker_key = storage.review_dedupe_key("tenant", incident_id)
+        if held == "processing_recovery":
+            assert queue.claim_next("tenant") is not None
+        get = storage.get_json
+        taken, release = threading.Event(), threading.Event()
+        expected_status = "pending" if held == "pending_claim" else "processing"
+
+        def snapshot(key):
+            result = get(key)
+            if key == marker_key and result and result.get("status") == expected_status and not taken.is_set():
+                taken.set()
+                assert release.wait(10)
+            return result
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", snapshot)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                action = queue.claim_next if held == "pending_claim" else queue.recover_stale_processing
+                stale = executor.submit(action, "tenant")
+                try:
+                    assert taken.wait(10)
+                    if held == "pending_claim":
+                        assert queue.claim_next("tenant") is not None
+                    if terminal == "completed":
+                        queue.mark_completed("tenant", incident_id, {})
+                    else:
+                        queue.mark_failed("tenant", incident_id, "unavailable")
+                    assert IncidentStore(storage).apply_retention("tenant") == 0
+                    assert queue.enqueue("tenant", review_context) == incident_id
+                    # Both the record and the fence are ordinary ageable objects.
+                    for key in storage.list_keys("tenant/review_dedupe/") + storage.list_keys("tenant/review_claims/"):
+                        entry = get(key)
+                        entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
+                        storage.put_json(key, entry)
+                    assert IncidentStore(storage).apply_retention("tenant") == 2
+                    assert IncidentStore(storage).apply_retention("tenant") == 0
+                finally:
+                    release.set()
+                assert stale.result(timeout=10) == (None if held == "pending_claim" else 0)
+        assert storage.list_keys("tenant/queue/") == []
+        # Keep live pending/processing reviews even if their creation date is old.
+        for state in ("processing", "pending"):
+            context = {**review_context, "head_sha": state}
+            live_id = queue.enqueue("tenant", context)
+            if state == "processing":
+                assert queue.claim_next("tenant")["incident_id"] == live_id
+            for key in storage.list_keys("tenant/"):
+                entry = storage.get_json(key)
+                entry["created_at"] = "2020-01-01T00:00:00+00:00"
+                if "claimed_at" in entry:
+                    entry["claimed_at"] = entry["created_at"]
+                storage.put_json(key, entry)
+            assert IncidentStore(storage).apply_retention("tenant") == 0
+        assert queue.recover_stale_processing("tenant") == 1
+        assert all(queue.claim_next("tenant") is not None for _ in range(2))
+
+    @pytest.mark.parametrize("field", ["type", "scm_platform", "repo", "change_id", "head_sha"])
+    @pytest.mark.parametrize("missing", [False, True])
+    def test_incomplete_review_identity_is_not_deduped(self, review_context, field, missing):
+        context = dict(review_context)
+        if missing:
+            del context[field]
+        else:
+            context[field] = ""
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        assert queue.enqueue("tenant", context) != queue.enqueue("tenant", context)
+        assert len(storage.list_keys("tenant/queue/pending/")) == 2
+        assert storage.list_keys("tenant/review_dedupe/") == []
+
+    @pytest.mark.parametrize("provider", ["gitlab", "bitbucket"])
+    @pytest.mark.parametrize("timing", ["before", "after"])
+    def test_concurrent_deliveries_survive_failed_publisher(self, monkeypatch, review_context, provider, timing):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        context = {**review_context, "scm_platform": provider}
+        put = storage.put_json_if_absent
+        waiting, release = threading.Event(), threading.Event()
+        first = True
+        lock = threading.Lock()
+
+        def write(key, data):
+            nonlocal first
+            with lock:
+                owner = first and "/queue/pending/" in key
+                if owner:
+                    first = False
+            if owner:
+                if timing == "after":
+                    put(key, data)
+                waiting.set()
+                assert release.wait(10)
+                raise RuntimeError("publisher failed")
+            return put(key, data)
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", write)
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                owner = executor.submit(queue.enqueue, "tenant", context)
+                try:
+                    assert waiting.wait(10)
+                    duplicates = [executor.submit(queue.enqueue, "tenant", context) for _ in range(7)]
+                    ids = [future.result(timeout=10) for future in duplicates]
+                finally:
+                    release.set()
+                assert owner.result(timeout=10) == ids[0]
+        assert len(set(ids)) == 1
+        # Hold the winner's final pending snapshot while a second caller claims.
+        get = storage.get_json
+        marker_key = storage.review_dedupe_key("tenant", ids[0])
+        snapshot_taken, release_snapshot = threading.Event(), threading.Event()
+        owner_thread = None
+        counts = {}
+
+        def hold_claim_snapshot(key):
+            nonlocal owner_thread
+            entry = get(key)
+            if key == marker_key:
+                thread = threading.get_ident()
+                if owner_thread is None:
+                    owner_thread = thread
+                counts[thread] = counts.get(thread, 0) + 1
+                if thread == owner_thread and counts[thread] == 2:
+                    snapshot_taken.set()
+                    assert release_snapshot.wait(10)
+            return entry
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", hold_claim_snapshot)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                winner = executor.submit(queue.claim_next, "tenant")
+                try:
+                    assert snapshot_taken.wait(10)
+                    assert queue.claim_next("tenant") is None
+                finally:
+                    release_snapshot.set()
+                assert winner.result(timeout=10)["incident_id"] == ids[0]
+        assert queue.claim_next("tenant") is None
+
+
+@pytest.mark.parametrize("action", ["open", "reopen", "update"])
+@pytest.mark.parametrize("state", ["closed", "merged"])
+def test_gitlab_terminal_state_never_enqueues(gitlab_request, gitlab_payload, action, state):
+    attrs = gitlab_payload["object_attributes"]
+    attrs.update(action=action, state=state, oldrev="previous")
+    with patch("api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")) as enqueue:
+        response = gitlab_request(gitlab_payload)
+        assert response.json()["status"] == "ignored"
+        assert enqueue.call_count == 0
+        attrs["state"] = "opened"
+        assert gitlab_request(gitlab_payload).json()["status"] == "queued"
+        assert enqueue.call_count == 1
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_terminal_cleanup_retries_from_durable_context(monkeypatch, review_context, terminal):
+    monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+    storage = MemoryStorage()
+    queue = IncidentQueue(storage)
+    incident_id = queue.enqueue("tenant", review_context)
+    queue.claim_next("tenant")
+    put = storage.put_json
+    def fail_fence(key, data):
+        if "/review_claims/" in key:
+            raise RuntimeError("fence write failed")
+        return put(key, data)
+    failure = None
+    with monkeypatch.context() as injection:
+        injection.setattr(storage, "put_json", fail_fence)
+        try:
+            if terminal == "completed":
+                queue.mark_completed("tenant", incident_id, {})
+            else:
+                queue.mark_failed("tenant", incident_id, "unavailable")
+        except RuntimeError as error:
+            failure = error
+    assert failure is not None
+    assert queue.enqueue("tenant", review_context) == incident_id
+    if terminal == "completed":
+        queue.mark_completed("tenant", incident_id, {})
+    else:
+        queue.mark_failed("tenant", incident_id, "unavailable")
+    marker_key = storage.review_dedupe_key("tenant", incident_id)
+    assert storage.get_json(marker_key).get("context") == review_context
+    assert queue.claim_next("tenant") is None
+    assert storage.list_keys("tenant/queue/") == []
+
+
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+def test_retention_cleans_interrupted_terminal_transition(monkeypatch, review_context, terminal):
+    monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+    storage = MemoryStorage()
+    queue = IncidentQueue(storage)
+    incident_id = queue.enqueue("tenant", review_context)
+    queue.claim_next("tenant")
+    # A terminal marker landed; the process stopped before updating its fence/index.
+    marker_key = storage.review_dedupe_key("tenant", incident_id)
+    entry = storage.get_json(marker_key)
+    entry.update(status=terminal)
+    entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
+    storage.put_json(marker_key, entry)
+    assert IncidentStore(storage).apply_retention("tenant") == 3
+    assert storage.list_keys("tenant/") == []
+    assert queue.claim_next("tenant") is None
+
+
+@pytest.mark.parametrize("event", ["Push Hook", "Note Hook", "Tag Push Hook"])
+def test_gitlab_event_filter_has_positive_control(gitlab_request, gitlab_payload, event):
+    with patch("api.server.enqueue_incident", new=AsyncMock(return_value="INC-review")) as enqueue:
+        assert gitlab_request(gitlab_payload, event).json()["status"] == "ignored"
+        assert enqueue.call_count == 0
+        assert gitlab_request(gitlab_payload).json()["status"] == "queued"
+        assert enqueue.call_count == 1
+
+
+@pytest.mark.parametrize("status", ["pending", "processing", "completed", "failed"])
+def test_legacy_record_replay_requires_published_active_work(monkeypatch, review_context, status):
+    storage = MemoryStorage()
+    queue = IncidentQueue(storage)
+    incident_id = queue.enqueue("tenant", review_context)
+    marker = storage.get_json(storage.review_dedupe_key("tenant", incident_id))
+    # Match pre-upgrade records, which have no index/reference field.
+    storage._objects.clear()
+    marker.pop("review_key")
+    marker["status"] = status
+    storage.put_json(storage.queue_key("tenant", "reviews", incident_id), marker)
+    def fail_index(key, data):
+        raise RuntimeError("active index unavailable")
+    failure = None
+    with monkeypatch.context() as injection:
+        injection.setattr(storage, "put_json_if_absent", fail_index)
+        try:
+            queue.enqueue("tenant", review_context)
+        except RuntimeError as error:
+            failure = error
+    assert (failure is not None) == (status in ("pending", "processing"))
+    assert queue.enqueue("tenant", review_context) == incident_id
+    if status == "pending":
+        assert queue.claim_next("tenant")["incident_id"] == incident_id
+    elif status == "processing":
+        storage.put_json(storage.review_claim_key("tenant", incident_id), marker)
+        assert queue.recover_stale_processing("tenant") == 1
+        assert queue.claim_next("tenant")["incident_id"] == incident_id
+    else:
+        assert queue.claim_next("tenant") is None
+
+
+@pytest.mark.parametrize("status", ["pending", "processing"])
+def test_retention_preserves_legacy_active_reviews(monkeypatch, review_context, status):
+    monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+    storage = MemoryStorage()
+    legacy_key = storage.queue_key("tenant", "reviews", "INC-legacy")
+    entry = {"incident_id": "INC-legacy", "org_id": "tenant", "context": review_context,
+             "status": status, "created_at": "2020-01-01T00:00:00+00:00"}
+    storage.put_json(legacy_key, entry)
+    assert IncidentStore(storage).apply_retention("tenant") == 0
+    assert storage.get_json(legacy_key) == entry
+
+
+def test_retention_aborts_on_s3_fence_head_failure(monkeypatch, review_context):
+    from storage.s3_storage import S3Storage
+
+    monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+    storage = MemoryStorage()
+    queue = IncidentQueue(storage)
+    incident_id = queue.enqueue("tenant", review_context)
+    queue.claim_next("tenant")
+    queue.mark_completed("tenant", incident_id, {})
+    marker_key = storage.review_dedupe_key("tenant", incident_id)
+    entry = storage.get_json(marker_key)
+    entry["completed_at"] = "2020-01-01T00:00:00+00:00"
+    storage.put_json(marker_key, entry)
+    remove = storage.delete
+    fail_head = True
+
+    class Client:
+        def head_object(self, Bucket, Key):
+            assert Bucket == "test-bucket"
+            if fail_head and "/review_claims/" in Key:
+                raise TimeoutError("HEAD unavailable")
+            if Key not in storage._objects:
+                raise Exception("404")
+            return {}
+
+        def delete_object(self, Bucket, Key):
+            assert Bucket == "test-bucket"
+            remove(Key)
+
+    storage.bucket = "test-bucket"
+    storage._client = Client()
+    storage.exists = S3Storage.exists.__get__(storage)
+    storage.delete = S3Storage.delete.__get__(storage)
+    failure = None
+    try:
+        IncidentStore(storage).apply_retention("tenant")
+    except TimeoutError as error:
+        failure = error
+    assert failure is not None
+    assert storage.get_json(marker_key) == entry
+    assert queue.enqueue("tenant", review_context) == incident_id
+    assert queue.claim_next("tenant") is None
+    fail_head = False
+    assert IncidentStore(storage).apply_retention("tenant") == 2
+    assert storage.list_keys("tenant/") == []

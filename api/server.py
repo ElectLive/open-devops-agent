@@ -555,6 +555,8 @@ async def gitlab_webhook(
         attrs = payload.get("object_attributes") or {}
         action = (attrs.get("action") or "").lower()
         if action in ("open", "reopen") or (action == "update" and "oldrev" in attrs):
+            if (attrs.get("state") or "").lower() in ("closed", "merged"):
+                return {"status": "ignored", "reason": "closed_mr"}
             if attrs.get("work_in_progress") or attrs.get("draft"):
                 return {"status": "ignored", "reason": "draft_mr"}
             project = payload.get("project") or {}
@@ -613,6 +615,8 @@ async def bitbucket_webhook(
         pr = payload.get("pullrequest") or {}
         if pr.get("draft") or (pr.get("state") or "").upper() == "DRAFT":
             return {"status": "ignored", "reason": "draft_pr"}
+        if (pr.get("state") or "").upper() != "OPEN":
+            return {"status": "ignored", "reason": "closed_pr"}
         repo = payload.get("repository") or {}
         workspace = (repo.get("workspace") or {}).get("slug") or ""
         slug = repo.get("slug") or repo.get("name") or ""
