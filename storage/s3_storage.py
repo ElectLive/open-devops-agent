@@ -55,10 +55,7 @@ class S3Storage(StorageProvider):
 
     def put_json_if_absent(self, key: str, data: Any) -> bool:
         body = json.dumps(data, indent=2, default=str).encode("utf-8")
-        try:
-            from botocore.exceptions import ClientError, ParamValidationError
-        except ImportError:
-            return super().put_json_if_absent(key, data)
+        from botocore.exceptions import ClientError, ParamValidationError
         try:
             self._client.put_object(
                 Bucket=self.bucket,
@@ -68,11 +65,11 @@ class S3Storage(StorageProvider):
                 IfNoneMatch="*",
             )
             return True
-        except ParamValidationError:
-            return super().put_json_if_absent(key, data)
+        except ParamValidationError as exc:
+            raise RuntimeError("S3 SDK must support conditional writes (IfNoneMatch)") from exc
         except ClientError as exc:
             code = exc.response.get("Error", {}).get("Code", "")
-            if code in {"PreconditionFailed", "ConditionalRequestConflict"}:
+            if code == "PreconditionFailed":
                 return False
             raise
 
@@ -111,5 +108,8 @@ class S3Storage(StorageProvider):
         try:
             self._client.head_object(Bucket=self.bucket, Key=key)
             return True
-        except Exception:
-            return False
+        except Exception as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
+            if code in {"404", "NoSuchKey", "NotFound"} or str(exc) == "404":
+                return False
+            raise

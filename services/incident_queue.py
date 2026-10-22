@@ -28,74 +28,171 @@ QUEUE_REVIEWS = "reviews"
 class IncidentQueue:
     def __init__(self, storage: Optional[StorageProvider] = None):
         self.storage = storage or get_storage()
+        self._legacy_adopted = False
 
     def enqueue(self, org_id: str, context: dict, incident_id: Optional[str] = None) -> str:
-        identity = [
-            org_id,
-            context.get("scm_platform"),
-            context.get("repo"),
-            context.get("change_id"),
-            context.get("head_sha"),
-        ]
+        identity = [org_id, context.get("scm_platform"), context.get("repo"),
+                    context.get("change_id"), context.get("head_sha")]
         is_review = context.get("type") == "code_review" and all(identity)
-        if is_review:
-            digest = hashlib.sha256(
-                json.dumps(identity, separators=(",", ":")).encode("utf-8")
-            ).hexdigest()
-            incident_id = f"INC-review-{digest}"
-        else:
-            incident_id = incident_id or f"INC-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:6]}"
-        entry = {
-            "incident_id": incident_id,
-            "org_id": org_id,
-            "context": context,
-            "status": QUEUE_PENDING,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "attempts": 0,
-        }
-        if is_review:
-            # This durable queue entry is also the dedupe record, in every state.
-            key = self.storage.queue_key(org_id, QUEUE_REVIEWS, incident_id)
+        incident_id = incident_id or f"INC-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}-{uuid4().hex[:6]}"
+        entry = {"incident_id": incident_id, "org_id": org_id, "context": context,
+                 "status": QUEUE_PENDING, "created_at": datetime.now(timezone.utc).isoformat(), "attempts": 0}
+        if not is_review:
+            self.storage.put_json(self.storage.queue_key(org_id, QUEUE_PENDING, incident_id), entry)
+            log.info("Incident enqueued", incident_id=incident_id, org_id=org_id)
+            return incident_id
+
+        digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode("utf-8")).hexdigest()
+        review_id = f"INC-review-{digest}"
+        prefix = self.storage.org_prefix(org_id, "review_heads", review_id) + "/"
+        keys = self.storage.list_keys(prefix)
+        if not keys:
+            legacy_key = self.storage.queue_key(org_id, QUEUE_REVIEWS, review_id)
+            legacy = self.storage.get_json(legacy_key)
+            if legacy:
+                if legacy.get("status") not in (QUEUE_PENDING, QUEUE_PROCESSING):
+                    return legacy["incident_id"]
+                self._adopt_legacy_review(org_id, legacy_key, legacy)
+                keys = self.storage.list_keys(prefix)
+        sequence = 0
+        slot = None
+        if keys:
+            slot_key = max(keys, key=lambda key: int(key.rsplit("/", 1)[-1].removesuffix(".json")))
+            slot = self.storage.get_json(slot_key)
+            if not slot:
+                raise RuntimeError("Review lineage record is missing")
+            terminal = self.storage.get_json(self.storage.review_release_key(org_id, slot["incident_id"]))
+            if not terminal:
+                failed = self.storage.get_json(self.storage.queue_key(org_id, QUEUE_FAILED, slot["incident_id"]))
+                if failed and not self.storage.exists(slot["review_key"]):
+                    terminal = self._record_terminal(org_id, failed)
+            if terminal and terminal["status"] == QUEUE_COMPLETED:
+                return slot["incident_id"]
+            if terminal and terminal["status"] == QUEUE_FAILED:
+                sequence = int(slot_key.rsplit("/", 1)[-1].removesuffix(".json")) + 1
+                slot = None
+        if slot is None:
+            entry["incident_id"] = f"{review_id}-{uuid4().hex}"
+            slot = self._reserve_review_slot(org_id, review_id, sequence, entry)
+        entry.update(slot)
+        return self._publish_review(org_id, entry)
+
+    def _reserve_review_slot(self, org_id: str, review_id: str, sequence: int, entry: dict) -> dict:
+        key = self.storage.review_slot_key(org_id, review_id, sequence)
+        proposal = {"incident_id": entry["incident_id"], "org_id": org_id,
+                    "created_at": entry["created_at"], "review_slot": key,
+                    "review_key": self.storage.review_dedupe_key(org_id, entry["incident_id"])}
+        try:
+            self.storage.put_json_if_absent(key, proposal)
+        except Exception:
+            if not self.storage.get_json(key):
+                raise
+        slot = self.storage.get_json(key)
+        if not slot:
+            raise RuntimeError("Review lineage record is missing")
+        return slot
+
+    def _publish_review(self, org_id: str, entry: dict) -> str:
+        incident_id, key = entry["incident_id"], entry["review_key"]
+        terminal_key = self.storage.review_release_key(org_id, incident_id)
+        failed_key = self.storage.queue_key(org_id, QUEUE_FAILED, incident_id)
+        if self.storage.exists(terminal_key) or self.storage.get_json(failed_key):
+            return incident_id
+        canonical = self.storage.get_json(key)
+        if not canonical:
             try:
-                created = self.storage.put_json_if_absent(key, entry)
+                self.storage.put_json_if_absent(key, entry)
             except Exception:
-                # Resolve an ambiguous write only by confirming real queued work.
-                if not self.storage.exists(key):
+                if self.storage.exists(terminal_key) or self.storage.get_json(failed_key):
+                    return incident_id
+                if not self.storage.get_json(key):
                     raise
-                created = False
-            if not created:
-                log.info("Review head already queued", incident_id=incident_id, org_id=org_id)
-                return incident_id
-        else:
-            key = self.storage.queue_key(org_id, QUEUE_PENDING, incident_id)
-            self.storage.put_json(key, entry)
-        log.info("Incident enqueued", incident_id=incident_id, org_id=org_id)
+            canonical = self.storage.get_json(key)
+            if not canonical:
+                if self.storage.exists(terminal_key) or self.storage.get_json(failed_key):
+                    return incident_id
+                raise RuntimeError("Review publication did not persist")
+        if canonical.get("status") in (QUEUE_PROCESSING, QUEUE_COMPLETED, QUEUE_FAILED):
+            return incident_id
+        pending_key = self.storage.queue_key(org_id, QUEUE_PENDING, incident_id)
+        try:
+            self.storage.put_json_if_absent(pending_key, canonical)
+        except Exception:
+            if not (self.storage.exists(terminal_key) or self.storage.get_json(failed_key)
+                    or self.storage.get_json(self.storage.review_claim_key(org_id, incident_id))
+                    or self.storage.exists(pending_key)):
+                raise
+        if self.storage.exists(terminal_key):
+            self.storage.delete(pending_key)
         return incident_id
+
+    def adopt_legacy_reviews(self) -> int:
+        """Adopt active legacy work once at startup, outside the poll path."""
+        if self._legacy_adopted:
+            return 0
+        adopted = 0
+        for key in self.storage.list_keys(""):
+            parts = key.split("/")
+            if len(parts) != 4 or parts[1:3] != ["queue", QUEUE_REVIEWS]:
+                continue
+            entry = self.storage.get_json(key)
+            if entry and entry.get("status") in (QUEUE_PENDING, QUEUE_PROCESSING):
+                self._adopt_legacy_review(parts[0], key, entry)
+                adopted += 1
+        self._legacy_adopted = True
+        return adopted
+
+    def _adopt_legacy_review(self, org_id: str, key: str, legacy: dict):
+        entry = dict(legacy)
+        if entry.get("status") == QUEUE_PROCESSING:
+            entry["recovered_at"] = datetime.now(timezone.utc).isoformat()
+        entry["status"] = QUEUE_PENDING
+        slot = self._reserve_review_slot(org_id, legacy["incident_id"], 0, entry)
+        if slot["incident_id"] != legacy["incident_id"]:
+            raise RuntimeError("Legacy review conflicts with existing lineage")
+        entry.update(slot)
+        self._publish_review(org_id, entry)
+        pending_key = self.storage.queue_key(org_id, QUEUE_PENDING, entry["incident_id"])
+        terminal_key = self.storage.review_release_key(org_id, entry["incident_id"])
+        if not (self.storage.exists(pending_key) or self.storage.exists(terminal_key)):
+            raise RuntimeError("Legacy review publication did not persist")
+        # This source key belongs only to the adopted legacy attempt.
+        self.storage.delete(key)
 
     def claim_next(self, org_id: str) -> Optional[Dict[str, Any]]:
         """Claim one pending incident. A second caller cannot receive the same id."""
         prefix = self.storage.org_prefix(org_id, "queue", QUEUE_PENDING)
-        review_prefix = self.storage.org_prefix(org_id, "queue", QUEUE_REVIEWS)
-        for key in self.storage.list_keys(prefix) + self.storage.list_keys(review_prefix):
+        for key in self.storage.list_keys(prefix):
             entry = self.storage.get_json(key)
-            if not entry or entry.get("status") != QUEUE_PENDING:
+            if not entry:
                 continue
-
             incident_id = entry["incident_id"]
+            review_key = entry.get("review_key")
+            if review_key:
+                if self.storage.exists(self.storage.review_release_key(org_id, incident_id)):
+                    self.storage.delete(key)
+                    continue
+                if self.storage.get_json(self.storage.queue_key(org_id, QUEUE_FAILED, incident_id)):
+                    continue
+                entry = self.storage.get_json(review_key)
+                if not entry or entry["incident_id"] != incident_id:
+                    self.storage.delete(key)
+                    continue
+            if entry.get("status") != QUEUE_PENDING:
+                continue
             entry["status"] = QUEUE_PROCESSING
             entry["claimed_at"] = datetime.now(timezone.utc).isoformat()
             entry["attempts"] = entry.get("attempts", 0) + 1
-
-            is_review = key.startswith(review_prefix + "/")
-            proc_key = (
-                self._review_claim_key(org_id, incident_id)
-                if is_review
-                else self.storage.queue_key(org_id, QUEUE_PROCESSING, incident_id)
-            )
+            proc_key = (self.storage.review_claim_key(org_id, incident_id) if review_key
+                        else self.storage.queue_key(org_id, QUEUE_PROCESSING, incident_id))
+            if review_key and not self.storage.exists(key):
+                continue
             if not self.storage.put_json_if_absent(proc_key, entry):
                 continue
-            if is_review:
-                self.storage.put_json(key, entry)
+            if review_key:
+                if self.storage.exists(self.storage.review_release_key(org_id, incident_id)):
+                    continue
+                self.storage.put_json(review_key, entry)
                 return entry
             if not self.storage.delete(key):
                 self.storage.delete(proc_key)
@@ -104,60 +201,95 @@ class IncidentQueue:
         return None
 
     def recover_stale_processing(self, org_id: str) -> int:
-        """Move processing items back to pending (e.g. after crash mid-run)."""
-        prefix = self.storage.org_prefix(org_id, "queue", QUEUE_PROCESSING)
+        """Recover processing work after the previous worker has stopped."""
         recovered = 0
-        for key in self.storage.list_keys(prefix):
+        for key in self.storage.list_keys(self.storage.org_prefix(org_id, "queue", QUEUE_PROCESSING)):
             entry = self.storage.get_json(key)
             if not entry:
                 continue
-            incident_id = entry["incident_id"]
             entry["status"] = QUEUE_PENDING
             entry["recovered_at"] = datetime.now(timezone.utc).isoformat()
-            pending_key = self.storage.queue_key(org_id, QUEUE_PENDING, incident_id)
-            self.storage.put_json(pending_key, entry)
+            self.storage.put_json(self.storage.queue_key(org_id, QUEUE_PENDING, entry["incident_id"]), entry)
             self.storage.delete(key)
             recovered += 1
-            log.warning("Recovered stale incident", incident_id=incident_id, org_id=org_id)
-        review_prefix = self.storage.org_prefix(org_id, "queue", QUEUE_REVIEWS)
-        for key in self.storage.list_keys(review_prefix):
-            entry = self.storage.get_json(key)
-            if not entry or entry.get("status") not in (QUEUE_PENDING, QUEUE_PROCESSING):
+        for key in self.storage.list_keys(self.storage.org_prefix(org_id, "queue", QUEUE_PENDING)):
+            index = self.storage.get_json(key)
+            if not index or not index.get("review_key"):
                 continue
-            claim_key = self._review_claim_key(org_id, entry["incident_id"])
+            incident_id = index["incident_id"]
+            terminal = self.storage.get_json(self.storage.review_release_key(org_id, incident_id))
+            if terminal:
+                if terminal["status"] == QUEUE_COMPLETED:
+                    self.mark_completed(org_id, incident_id, terminal.get("result_summary", {}))
+                else:
+                    self.storage.delete(key)
+                continue
+            failed = self.storage.get_json(self.storage.queue_key(org_id, QUEUE_FAILED, incident_id))
+            if failed:
+                self.mark_failed(org_id, incident_id, failed.get("error", "Review failed"))
+                continue
+            entry = self.storage.get_json(index["review_key"])
+            claim_key = self.storage.review_claim_key(org_id, incident_id)
             claim = self.storage.get_json(claim_key)
-            if not claim or claim.get("status") != QUEUE_PROCESSING:
+            if not entry or not claim or claim.get("status") != QUEUE_PROCESSING:
                 continue
-            # The claim can survive a stop before the queue's status update.
-            entry = claim
-            entry["status"] = QUEUE_PENDING
-            entry["recovered_at"] = datetime.now(timezone.utc).isoformat()
-            self.storage.put_json(key, entry)
+            if self.storage.exists(self.storage.review_release_key(org_id, incident_id)):
+                continue
+            claim.update({"review_key": index["review_key"], "review_slot": index["review_slot"],
+                          "status": QUEUE_PENDING, "recovered_at": datetime.now(timezone.utc).isoformat()})
+            self.storage.put_json(index["review_key"], claim)
             self.storage.delete(claim_key)
             recovered += 1
-            log.warning("Recovered stale incident", incident_id=entry["incident_id"], org_id=org_id)
         return recovered
 
     def mark_completed(self, org_id: str, incident_id: str, result: dict):
         entry = self._get_processing(org_id, incident_id) or {"incident_id": incident_id, "org_id": org_id}
         entry["status"] = QUEUE_COMPLETED
         entry["completed_at"] = datetime.now(timezone.utc).isoformat()
-        entry["result_summary"] = {
-            "resolved": result.get("resolved"),
-            "steps": result.get("steps"),
-        }
-        key = self._state_key(org_id, QUEUE_COMPLETED, incident_id)
-        self.storage.put_json(key, entry)
-        self._delete_processing(org_id, incident_id)
+        entry["result_summary"] = {"resolved": result.get("resolved"), "steps": result.get("steps")}
+        if entry.get("review_key"):
+            terminal = self._record_terminal(org_id, entry)
+            if terminal["status"] != QUEUE_COMPLETED:
+                return
+            entry.update(terminal)
+            self.storage.put_json(entry["review_key"], entry)
+            self._finish_review(org_id, entry)
+        else:
+            self.storage.put_json(self.storage.queue_key(org_id, QUEUE_COMPLETED, incident_id), entry)
+            self._delete_processing(org_id, incident_id)
 
     def mark_failed(self, org_id: str, incident_id: str, error: str):
         entry = self._get_processing(org_id, incident_id) or {"incident_id": incident_id, "org_id": org_id}
-        entry["status"] = QUEUE_FAILED
-        entry["failed_at"] = datetime.now(timezone.utc).isoformat()
-        entry["error"] = error
-        key = self._state_key(org_id, QUEUE_FAILED, incident_id)
-        self.storage.put_json(key, entry)
-        self._delete_processing(org_id, incident_id)
+        if entry.get("review_key"):
+            terminal = self.storage.get_json(self.storage.review_release_key(org_id, incident_id))
+            if terminal and terminal["status"] == QUEUE_COMPLETED:
+                return
+        if entry.get("status") != QUEUE_FAILED:
+            entry.update(status=QUEUE_FAILED, failed_at=datetime.now(timezone.utc).isoformat(), error=error)
+        # Persist failure before releasing this attempt's authority.
+        self.storage.put_json(self.storage.queue_key(org_id, QUEUE_FAILED, incident_id), entry)
+        if entry.get("review_key"):
+            current = self.storage.get_json(entry["review_key"])
+            if current and current["incident_id"] == incident_id:
+                self.storage.put_json(entry["review_key"], entry)
+            self._finish_review(org_id, entry)
+        else:
+            self._delete_processing(org_id, incident_id)
+
+    def _record_terminal(self, org_id: str, entry: dict) -> dict:
+        status = entry["status"]
+        ended = "completed_at" if status == QUEUE_COMPLETED else "failed_at"
+        terminal = {"incident_id": entry["incident_id"], "org_id": org_id,
+                    "status": status, ended: entry[ended]}
+        if status == QUEUE_COMPLETED:
+            terminal["result_summary"] = entry.get("result_summary", {})
+        key = self.storage.review_release_key(org_id, entry["incident_id"])
+        try:
+            self.storage.put_json_if_absent(key, terminal)
+        except Exception:
+            if not self.storage.get_json(key):
+                raise
+        return self.storage.get_json(key)
 
     def list_pending_org_ids(self) -> List[str]:
         """Orgs to poll: env config plus any org with pending/processing queue items."""
@@ -175,10 +307,6 @@ class IncidentQueue:
             parts = key.split("/")
             if len(parts) >= 4 and parts[1] == "queue" and parts[2] in (QUEUE_PENDING, QUEUE_PROCESSING):
                 orgs.add(parts[0])
-            elif len(parts) >= 4 and parts[1:3] == ["queue", QUEUE_REVIEWS]:
-                entry = self.storage.get_json(key)
-                if entry and entry.get("status") in (QUEUE_PENDING, QUEUE_PROCESSING):
-                    orgs.add(parts[0])
 
         return list(orgs)
 
@@ -186,19 +314,24 @@ class IncidentQueue:
         entry = self.storage.get_json(self.storage.queue_key(org_id, QUEUE_PROCESSING, incident_id))
         if entry:
             return entry
-        entry = self.storage.get_json(self.storage.queue_key(org_id, QUEUE_REVIEWS, incident_id))
-        return entry if entry and entry.get("status") == QUEUE_PROCESSING else None
+        failed = self.storage.get_json(self.storage.queue_key(org_id, QUEUE_FAILED, incident_id))
+        if failed and failed.get("review_key"):
+            return failed
+        entry = self.storage.get_json(self.storage.review_claim_key(org_id, incident_id))
+        if entry:
+            return entry
+        return None
 
-    def _state_key(self, org_id: str, status: str, incident_id: str) -> str:
-        review_key = self.storage.queue_key(org_id, QUEUE_REVIEWS, incident_id)
-        return (
-            review_key
-            if self.storage.exists(review_key)
-            else self.storage.queue_key(org_id, status, incident_id)
-        )
-
-    def _review_claim_key(self, org_id: str, incident_id: str) -> str:
-        return self.storage.org_prefix(org_id, "review_claims", f"{incident_id}.json")
+    def _finish_review(self, org_id: str, entry: dict):
+        incident_id = entry["incident_id"]
+        # Terminal fences remain, so an old pending snapshot cannot claim this attempt again.
+        self.storage.put_json(self.storage.review_claim_key(org_id, incident_id), entry)
+        if entry["status"] == QUEUE_FAILED:
+            current = self.storage.get_json(entry["review_key"])
+            if current and current["incident_id"] == incident_id:
+                self.storage.delete(entry["review_key"])
+            self._record_terminal(org_id, entry)
+        self.storage.delete(self.storage.queue_key(org_id, QUEUE_PENDING, incident_id))
 
     def _delete_processing(self, org_id: str, incident_id: str):
         self.storage.delete(self.storage.queue_key(org_id, QUEUE_PROCESSING, incident_id))

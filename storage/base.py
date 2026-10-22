@@ -74,6 +74,18 @@ class StorageProvider(ABC):
     def queue_key(self, org_id: str, status: str, incident_id: str) -> str:
         return self.org_prefix(org_id, "queue", status, f"{incident_id}.json")
 
+    def review_dedupe_key(self, org_id: str, incident_id: str) -> str:
+        return self.org_prefix(org_id, "review_dedupe", f"{incident_id}.json")
+
+    def review_slot_key(self, org_id: str, review_id: str, sequence: int) -> str:
+        return self.org_prefix(org_id, "review_heads", review_id, f"{sequence:020d}.json")
+
+    def review_release_key(self, org_id: str, incident_id: str) -> str:
+        return self.org_prefix(org_id, "review_releases", f"{incident_id}.json")
+
+    def review_claim_key(self, org_id: str, incident_id: str) -> str:
+        return self.org_prefix(org_id, "review_claims", f"{incident_id}.json")
+
     def doc_key(self, org_id: str, doc_path: str) -> str:
         safe_path = "/".join(_safe_path_segment(p) for p in doc_path.split("/") if p)
         return self.org_prefix(org_id, "docs", safe_path)

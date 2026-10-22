@@ -10,6 +10,8 @@ import sys
 from types import ModuleType
 from unittest.mock import MagicMock
 
+import pytest
+
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -231,3 +233,96 @@ class TestAzureBlobStorage:
         mock_blob.exists.return_value = False
         store = _make_azure_store(mock_svc, mock_container)
         assert store.delete("missing.json") is False
+
+
+@pytest.mark.parametrize("unsupported", ["missing_sdk", "old_sdk"])
+def test_s3_conditional_creation_never_falls_back_to_plain_write(monkeypatch, unsupported):
+    from storage.s3_storage import S3Storage
+
+    class ClientError(Exception):
+        pass
+
+    class ParamValidationError(Exception):
+        pass
+
+    exceptions = ModuleType("botocore.exceptions")
+    exceptions.ClientError = ClientError
+    exceptions.ParamValidationError = ParamValidationError
+    monkeypatch.setitem(sys.modules, "botocore.exceptions", None if unsupported == "missing_sdk" else exceptions)
+    store = object.__new__(S3Storage)
+    store.bucket = "test-bucket"
+    calls = []
+
+    class Client:
+        def put_object(self, **kwargs):
+            calls.append(kwargs)
+            if "IfNoneMatch" in kwargs:
+                raise ParamValidationError("conditional writes unsupported")
+            return {}
+
+        def head_object(self, **kwargs):
+            raise RuntimeError("not found")
+
+    store._client = Client()
+    failure = None
+    try:
+        store.put_json_if_absent("key.json", {"value": 1})
+    except (ImportError, RuntimeError, ParamValidationError) as error:
+        failure = error
+    assert failure is not None
+    assert all("IfNoneMatch" in call for call in calls)
+
+
+def test_s3_conflict_is_not_evidence_of_an_existing_object(monkeypatch):
+    from storage.s3_storage import S3Storage
+
+    class ClientError(Exception):
+        response = {"Error": {"Code": "ConditionalRequestConflict"}}
+
+    class ParamValidationError(Exception):
+        pass
+
+    exceptions = ModuleType("botocore.exceptions")
+    exceptions.ClientError, exceptions.ParamValidationError = ClientError, ParamValidationError
+    monkeypatch.setitem(sys.modules, "botocore.exceptions", exceptions)
+    store = object.__new__(S3Storage)
+    store.bucket = "test-bucket"
+
+    class Client:
+        def put_object(self, **kwargs):
+            assert kwargs["IfNoneMatch"] == "*"
+            raise ClientError("conflicting conditional request")
+
+    store._client = Client()
+    failure = None
+    try:
+        store.put_json_if_absent("key.json", {})
+    except ClientError as error:
+        failure = error
+    assert failure is not None
+
+
+@pytest.mark.parametrize("code", ["404", "NoSuchKey", "NotFound", "AccessDenied", "SlowDown"])
+def test_s3_exists_distinguishes_absence_from_head_errors(code):
+    from storage.s3_storage import S3Storage
+
+    class HeadError(Exception):
+        response = {"Error": {"Code": code}}
+
+    class Client:
+        def head_object(self, Bucket, Key):
+            assert Bucket == "test-bucket" and Key == "key.json"
+            raise HeadError("HEAD failed")
+
+    store = object.__new__(S3Storage)
+    store.bucket = "test-bucket"
+    store._client = Client()
+    failure = None
+    try:
+        exists = store.exists("key.json")
+    except HeadError as error:
+        failure = error
+    if code in ("404", "NoSuchKey", "NotFound"):
+        assert failure is None and exists is False
+    else:
+        assert failure is not None
