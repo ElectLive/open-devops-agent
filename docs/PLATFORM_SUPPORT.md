@@ -215,13 +215,11 @@ ipconfig /all
 - Re-run failed jobs (`POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs`)
 
 **Setup:**
-```yaml
-# .github/workflows/notify-agent.yml
-- name: Notify Agent on Failure
-  if: failure()
-  run: |
-    curl -X POST $AGENT_URL/webhook \
-      -d '{"platform": "github", "event": "${{ github.event_name }}"}'
+```
+Repository Settings → Webhooks → Add webhook
+URL: $AGENT_URL/webhook/github
+Content type: application/json
+Events: Workflow runs
 ```
 
 ### GitLab CI/CD
@@ -233,20 +231,16 @@ ipconfig /all
 - Deployment tracking
 
 **Setup:**
-```yaml
-# .gitlab-ci.yml
-after_script:
-  - |
-    if [ "$CI_JOB_STATUS" = "failed" ]; then
-      curl -X POST $AGENT_URL/webhook \
-        -d '{"platform": "gitlab", "pipeline_id": "$CI_PIPELINE_ID"}'
-    fi
+```
+Project Settings → Webhooks → Add webhook
+URL: $AGENT_URL/webhook/gitlab
+Events: Pipeline events (agent handles failed pipelines)
 ```
 
 ### Jenkins
 
 **Capabilities:**
-- Webhook integration via notification plugin
+- Manual webhook ingress via `/webhook/manual`
 - Console log parsing
 - Build failure analysis
 - Plugin issue detection
@@ -257,7 +251,7 @@ after_script:
 // Jenkinsfile
 post {
   failure {
-    sh "curl -X POST $AGENT_URL/webhook -d '{\"platform\": \"jenkins\"}'"
+    sh "curl -X POST $AGENT_URL/webhook/manual -H 'Content-Type: application/json' -d '{\"type\": \"cicd\", \"labels\": {\"cicd_platform\": \"jenkins\"}}'"
   }
 }
 ```
