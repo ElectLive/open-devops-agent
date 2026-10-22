@@ -5,6 +5,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "dummy-test-key")
 import pytest
 
 from agent.core import DevOpsAgent
+from services.pii_scrubber import scrub_dict
 
 
 CONTEXT = {
@@ -54,6 +55,50 @@ def ci_logs():
 
 
 class TestDockerContext:
+    @pytest.mark.asyncio
+    async def test_docker_fragments_are_scrubbed_before_tail_slicing(self, ci_logs, monkeypatch):
+        agent = DevOpsAgent()
+        begin = "-----BEGIN PRIVATE KEY-----"
+        end = "-----END PRIVATE KEY-----"
+        body_line = "A" * 64
+        inline_body = "B" * 32
+        log = (
+            "Step 1/2 : FROM python:3.11-slim\n"
+            + begin + "\n"
+            + (body_line + "\n") * 60
+            + end + "\n"
+            "Step 2/2 : RUN make\n"
+            + "ERROR: failed to build " + begin + inline_body + end + "\n"
+        )
+        # The raw tail loses BEGIN while retaining synthetic body lines.
+        assert log.index(begin) < len(log) - 3000 < log.index(end)
+        ci_logs["failed_jobs"][0]["logs"] = log
+
+        async def fake_collect(repo, run_id):
+            return ci_logs
+
+        monkeypatch.setattr(agent.github_collector, "collect", fake_collect)
+        enriched = await agent._collect_context(CONTEXT)
+        scrubbed = scrub_dict(enriched)
+
+        assert scrubbed["docker_build_error"]["errors"] == [
+            "ERROR: failed to build [REDACTED_PRIVATE_KEY]",
+        ]
+
+        def assert_scrubbed(value):
+            if isinstance(value, dict):
+                for child in value.values():
+                    assert_scrubbed(child)
+            elif isinstance(value, list):
+                for child in value:
+                    assert_scrubbed(child)
+            elif isinstance(value, str):
+                assert body_line not in value
+                assert inline_body not in value
+
+        assert_scrubbed(scrubbed["ci_logs"])
+        assert_scrubbed(scrubbed["docker_build_error"])
+
     @pytest.mark.asyncio
     async def test_failed_docker_build_adds_first_parsed_error(self, ci_logs, monkeypatch):
         # Docker-failed direction: the first matching failed log supplies exact parser values.
