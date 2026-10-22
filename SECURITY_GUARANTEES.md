@@ -14,7 +14,7 @@
 - No external data exfiltration
 - All operations logged and audited
 - The six host-mutating tools require approval for live changes when `AUTO_APPLY=false`; dry runs remain available.
-- Credentials encrypted at rest
+- Org credentials stored without application-level encryption
 - API keys never logged
 - RBAC (Role-Based Access Control) enforced
 
@@ -66,12 +66,10 @@ roles:
 ```
 
 **Layer 3: Encryption**
-```bash
-# All credentials encrypted
-ANTHROPIC_API_KEY=<encrypted>
-DATABASE_PASSWORD=<encrypted>
-SMTP_PASSWORD=<encrypted>
 
+Org credentials are stored as plaintext JSON at `{org_id}/config/credentials.json`; application-level credential encryption is not implemented.
+
+```bash
 # TLS for all connections
 ENABLE_TLS=true
 TLS_CERT=/path/to/cert.pem
@@ -454,9 +452,10 @@ API_KEY=<strong-random-key>
 WEBHOOK_SECRET=<strong-secret>
 
 # Configure encryption
-ENCRYPT_CREDENTIALS=true
 TLS_ENABLED=true
 ```
+
+`ENCRYPT_CREDENTIALS` is not read by the application and does not enable credential encryption.
 
 **2. Network Security:**
 ```bash
@@ -570,7 +569,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 - Complete audit trail
 - Compliance with major standards
 - Network isolation support
-- Encryption at rest and in transit
+- Org credential storage has no application-level encryption
 
 ### Q2: Will it be hacked?
 
@@ -701,7 +700,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 
 **Your Organization Can Use This Agent Securely:**
 
-✅ **Secure** - Multiple security layers, encryption, authentication
+⚠️ **Credential storage** - Plaintext JSON without application-level encryption
 ✅ **Safe** - Never deletes data, email before risk, complete audit
 ✅ **Accurate** - 98.5% success rate, AI-powered, verified
 ✅ **Compliant** - SOC2, ISO27001, CIS, NIST, GDPR, PCI-DSS

@@ -384,7 +384,7 @@ data = await collector.collect({
 | Datadog | Webhook integration | Easy |
 | AWS CloudWatch | EventBridge + Lambda | Medium |
 | Azure Monitor | Action Group webhook | Easy |
-| PagerDuty | Webhook integration | Easy |
+| PagerDuty | Outgoing incident creation; incoming webhook not implemented | N/A for ingress |
 | Grafana | Alert notification channel | Easy |
 
 ### Prometheus/AlertManager
@@ -419,14 +419,14 @@ route:
 
 | Category | Tools | Integration |
 |----------|-------|-------------|
-| **Version Control** | GitHub, GitLab, Bitbucket | Webhook, API |
-| **CI/CD** | Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bamboo | Webhook, API |
-| **Container Registry** | Docker Hub, ECR, GCR, ACR | API access |
-| **Infrastructure as Code** | Terraform, CloudFormation, ARM templates | CLI integration |
-| **Configuration Management** | Ansible, Chef, Puppet | CLI integration |
-| **Service Mesh** | Istio, Linkerd | K8s API |
-| **API Gateway** | Kong, Ambassador, Nginx | Config analysis |
-| **Secrets Management** | Vault, AWS Secrets Manager, Azure Key Vault | API access |
+| **Version Control** | GitHub, GitLab, Bitbucket Cloud | Built-in PR/MR webhooks and API tools |
+| **CI/CD** | Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bamboo | Built-in API log collectors and retry/rebuild tools; failure webhooks for GitHub Actions and GitLab CI; manual webhook ingress for Jenkins, Azure DevOps and Bamboo |
+| **Container Registry** | Docker Hub, ECR, GCR, Artifact Registry, ACR | Built-in ECR/Artifact Registry/ACR collectors; no dedicated Docker Hub or GCR API client |
+| **Infrastructure as Code** | Terraform, CloudFormation, ARM templates | Built-in Terraform validate/plan CLI tools; no dedicated CloudFormation or ARM template tools |
+| **Configuration Management** | Ansible, Chef, Puppet | No dedicated collectors or tools |
+| **Service Mesh** | Istio, Linkerd | Generic Kubernetes pod/log/event diagnostics; no mesh-specific collector or tool |
+| **API Gateway** | Kong, Ambassador, Nginx | Built-in Nginx diagnostics/configuration/reload tools; no dedicated Kong or Ambassador integration |
+| **Secrets Management** | Vault, AWS Secrets Manager, Azure Key Vault | No dedicated secret-store API integration |
 
 ---
 
