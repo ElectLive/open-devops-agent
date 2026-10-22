@@ -1753,7 +1753,8 @@ class TestReviewFailureRetry:
         assert queue.claim_next("tenant") is None
 
 
-    def test_delayed_publisher_cannot_resurrect_failed_marker(self, monkeypatch, review_context):
+    @pytest.mark.parametrize("successor_state", ["pending", "processing"])
+    def test_delayed_marker_publication_cannot_execute_terminal_attempt_or_disturb_successor(self, monkeypatch, review_context, successor_state):
         storage = MemoryStorage()
         queue = IncidentQueue(storage)
         put = storage.put_json_if_absent
@@ -1771,21 +1772,37 @@ class TestReviewFailureRetry:
                 publisher = executor.submit(queue.enqueue, "tenant", review_context)
                 try:
                     assert waiting.wait(10)
+                    old_id = queue.enqueue("tenant", review_context)
                     early = queue.claim_next("tenant")
-                    if early:
-                        queue.mark_failed("tenant", early["incident_id"], "unavailable")
+                    assert early is not None and early["incident_id"] == old_id
+                    queue.mark_failed("tenant", old_id, "unavailable")
+                    assert not storage.exists(early["review_key"])
+                    new_id = queue.enqueue("tenant", review_context)
+                    assert new_id != old_id
+                    new_marker = _review_marker_key(storage, "tenant", new_id)
+                    if successor_state == "processing":
+                        assert queue.claim_next("tenant")["incident_id"] == new_id
+                    successor = storage.get_json(new_marker)
+                    successor_slot = storage.get_json(successor["review_slot"])
+                    successor_index = storage.get_json(storage.queue_key("tenant", "pending", new_id))
+                    successor_claim = storage.get_json(storage.review_claim_key("tenant", new_id))
                 finally:
                     release.set()
-                old_id = publisher.result(timeout=10)
-        if not early:
-            later = queue.claim_next("tenant")
-            assert later is not None
-            assert later["incident_id"] == old_id
-            queue.mark_failed("tenant", old_id, "unavailable")
-        new_id = queue.enqueue("tenant", review_context)
-        assert new_id != old_id
+                assert publisher.result(timeout=10) == old_id
+        assert storage.get_json(new_marker) == successor
+        assert storage.get_json(successor["review_slot"]) == successor_slot
+        assert storage.get_json(storage.queue_key("tenant", "pending", new_id)) == successor_index
+        assert storage.get_json(storage.review_claim_key("tenant", new_id)) == successor_claim
         assert queue.enqueue("tenant", review_context) == new_id
-        assert queue.claim_next("tenant")["incident_id"] == new_id
+        next_claim = queue.claim_next("tenant")
+        old_claimable = next_claim is not None and next_claim["incident_id"] == old_id
+        print(f"DELAYED_MARKER successor={successor_state} restored={storage.exists(early['review_key'])} "
+              f"old_claimable={old_claimable} successor_preserved={storage.get_json(new_marker) is not None}")
+        assert not old_claimable
+        if successor_state == "pending":
+            assert next_claim and next_claim["incident_id"] == new_id
+        else:
+            assert next_claim is None
         assert queue.claim_next("tenant") is None
 
     def test_stale_failure_read_cannot_recreate_marker(self, monkeypatch, review_context):
