@@ -122,6 +122,13 @@ class Collector:
 - `GCPCollector` - Cloud Logging, resource status
 - `AzureCollector` - Activity logs, resource status
 
+During CI context collection, failed Docker build logs with classic `Step n[/m] :`
+markers are parsed by `collectors/docker.py`'s `parse_build_error`. The first
+matching log supplies `docker_build_error` in the incident context given to the
+model, containing the parser's first step line, error lines, and raw log tail.
+Non-Docker logs, Docker logs without error lines, and collector failures do not
+add `docker_build_error`.
+
 ### 5. Tools (tools/)
 
 **Purpose**: Execute actions to remediate incidents
