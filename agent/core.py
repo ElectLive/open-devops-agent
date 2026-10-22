@@ -1306,7 +1306,7 @@ class DevOpsAgent:
                     )
                     if not re.search(r"^Step \d+(?:/\d+)?[ \t]*:", log_text, re.MULTILINE):
                         continue
-                    build_error = parse_build_error(log_text)
+                    build_error = parse_build_error(scrub_text(log_text))
                     if build_error["errors"]:
                         enriched["docker_build_error"] = build_error
                         break
