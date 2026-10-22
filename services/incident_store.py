@@ -82,7 +82,7 @@ class IncidentStore:
         return entries
 
     def apply_retention(self, org_id: str) -> int:
-        """Expire aged payloads, including terminal review records and fences."""
+        """Expire aged payloads while preserving completed-head dedupe evidence."""
         if self.retention_days <= 0:
             return 0
         cutoff = datetime.now(timezone.utc) - timedelta(days=self.retention_days)
@@ -103,8 +103,39 @@ class IncidentStore:
                     continue
                 expired = obj_date < month_cutoff if month_granularity else obj_date < cutoff
                 if expired:
-                    if category == "review_dedupe" or legacy_review:
-                        # Keep terminal evidence until index/fence cleanup has landed.
+                    shared_head = category == "review_dedupe" or legacy_review
+                    if shared_head and entry.get("status") == QUEUE_FAILED:
+                        continue  # The failure transition owns shared marker release.
+                    if entry and entry.get("status") == QUEUE_COMPLETED and (
+                        category in ("review_dedupe", "review_claims") or legacy_review
+                    ):
+                        minimal = {
+                            "incident_id": entry["incident_id"],
+                            "org_id": org_id,
+                            "status": QUEUE_COMPLETED,
+                            "completed_at": entry["completed_at"],
+                        }
+                        if entry.get("review_key"):
+                            minimal["review_key"] = entry["review_key"]
+                        if category == "review_dedupe" or legacy_review:
+                            claim_key = self.storage.review_claim_key(org_id, entry["incident_id"])
+                            if self.storage.get_json(claim_key) != minimal:
+                                self.storage.put_json(claim_key, minimal)
+                            deleted += int(self.storage.delete(
+                                self.storage.queue_key(org_id, "pending", entry["incident_id"])
+                            ))
+                        if entry != minimal:
+                            self.storage.put_json(key, minimal)
+                        continue
+                    failed_review = (
+                        category == "queue" and entry and entry.get("review_key")
+                        and entry.get("status") == QUEUE_FAILED
+                    )
+                    if failed_review:
+                        marker = self.storage.get_json(entry["review_key"])
+                        if marker and marker["incident_id"] == entry["incident_id"]:
+                            continue  # Preserve evidence and index for worker cleanup.
+                        # Keep terminal evidence until this attempt's cleanup has landed.
                         incident_id = entry["incident_id"]
                         for related in (
                             self.storage.queue_key(org_id, "pending", incident_id),

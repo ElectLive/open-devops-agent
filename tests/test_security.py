@@ -526,6 +526,21 @@ def gitlab_payload():
 
 
 
+def _review_marker_key(storage, org_id, incident_id):
+    """Read the admitted attempt's reference instead of deriving it from its ID."""
+    for key in (storage.queue_key(org_id, "pending", incident_id),
+                storage.review_claim_key(org_id, incident_id),
+                storage.queue_key(org_id, "failed", incident_id)):
+        entry = storage.get_json(key)
+        if entry and entry.get("review_key"):
+            return entry["review_key"]
+    for key in storage.list_keys(storage.org_prefix(org_id, "review_dedupe")):
+        entry = storage.get_json(key)
+        if entry and entry["incident_id"] == incident_id:
+            return key
+    raise AssertionError("Review attempt has no marker reference")
+
+
 class TestGitlabReviewTriggers:
     @pytest.mark.parametrize("action", ["update", "approval", "approved", "unapproval", "unapproved", "close", "merge", ""])
     def test_ignores_actions_without_new_review_work(
@@ -601,18 +616,27 @@ class TestGitlabReviewTriggers:
         )
         repeat = gitlab_request(gitlab_payload)
         assert repeat.status_code == 200
+        expected_id = repeat.json()["incident_id"] if state == "failed" else incident_id
+        assert (expected_id != incident_id) == (state == "failed")
         assert repeat.json() == {
             "status": "queued",
             "type": "code_review",
-            "incident_id": incident_id,
+            "incident_id": expected_id,
         }
+        assert gitlab_request(gitlab_payload).json() == repeat.json()
         keys = review_queue.storage.list_keys("tenant-ash/review_dedupe/")
         assert len(keys) == 1
         entry = review_queue.storage.get_json(keys[0])
-        assert entry["status"] == state
+        assert entry["status"] == ("pending" if state == "failed" else state)
+        if state == "failed":
+            failed_key = review_queue.storage.queue_key(entry["org_id"], "failed", incident_id)
+            failed = review_queue.storage.get_json(failed_key)
+            assert failed and failed["status"] == "failed"
+            assert failed["context"]["head_sha"] == entry["context"]["head_sha"]
+            assert entry["incident_id"] != incident_id
         org = entry["org_id"]
         active_keys = review_queue.storage.list_keys(f"{org}/queue/pending/")
-        assert len(active_keys) == (0 if state in ("completed", "failed") else 1)
+        assert len(active_keys) == (0 if state == "completed" else 1)
         assert entry["context"].get("head_sha") == "commit-willow"
 
 
@@ -819,10 +843,16 @@ class TestBitbucketReviewTriggers:
         keys = review_queue.storage.list_keys("tenant-ember/review_dedupe/")
         assert len(keys) == 1
         entry = review_queue.storage.get_json(keys[0])
-        assert entry["status"] == state
+        assert entry["status"] == ("pending" if state == "failed" else state)
+        if state == "failed":
+            failed_key = review_queue.storage.queue_key(entry["org_id"], "failed", incident_id)
+            failed = review_queue.storage.get_json(failed_key)
+            assert failed and failed["status"] == "failed"
+            assert failed["context"]["head_sha"] == entry["context"]["head_sha"]
+            assert entry["incident_id"] != incident_id
         org = entry["org_id"]
         active_keys = review_queue.storage.list_keys(f"{org}/queue/pending/")
-        assert len(active_keys) == (0 if state in ("completed", "failed") else 1)
+        assert len(active_keys) == (0 if state == "completed" else 1)
         assert entry["context"].get("head_sha") == "commit-juniper"
 
 
@@ -907,14 +937,16 @@ class TestReviewQueueDurability:
         storage = RecordingStorage()
         queue = IncidentQueue(storage)
         counts = []
+        previous_size = 0
         for size in (100, 1000):
-            for index in range(len(storage.list_keys("tenant-history/review_dedupe/")), size):
+            for index in range(previous_size, size):
                 incident_id = queue.enqueue("tenant-history", {**review_context, "head_sha": str(index)})
                 queue.claim_next("tenant-history")
                 if terminal == "completed":
                     queue.mark_completed("tenant-history", incident_id, {})
                 else:
                     queue.mark_failed("tenant-history", incident_id, "unavailable")
+            previous_size = size
             for index in range(size):
                 storage.put_json(storage.queue_key("tenant-history", "reviews", f"legacy-{index}"),
                                  {"status": terminal, "incident_id": f"legacy-{index}"})
@@ -948,6 +980,9 @@ class TestReviewQueueDurability:
             if committed:
                 original(key, data)
                 if advanced != "pending":
+                    if stage == "marker":
+                        # Another delivery can publish while the marker reply is lost.
+                        queue.enqueue("tenant", review_context)
                     claimed = queue.claim_next("tenant")
                     assert claimed is not None
                     if advanced == "completed":
@@ -971,7 +1006,7 @@ class TestReviewQueueDurability:
             assert str(failure) == "lost write acknowledgement"
         incident_id = queue.enqueue("tenant", review_context)
         assert queue.enqueue("tenant", review_context) == incident_id
-        if committed and advanced != "pending":
+        if committed and advanced not in ("pending", "failed"):
             assert queue.claim_next("tenant") is None
         else:
             claimed = queue.claim_next("tenant")
@@ -979,9 +1014,11 @@ class TestReviewQueueDurability:
             assert claimed["incident_id"] == incident_id
             assert queue.claim_next("tenant") is None
 
-    @pytest.mark.parametrize("stage", ["pending", "marker", "claim", "processing", "terminal", "fence", "delete", "retention_index", "retention_fence", "retention_marker"])
+    @pytest.mark.parametrize("stage", ["pending", "marker", "claim", "processing", "terminal", "fence", "delete", "retention_index", "retention_fence", "retention_record", "failed_record", "marker_release"])
     @pytest.mark.parametrize("terminal", ["completed", "failed"])
     def test_process_crash_recovers_once(self, review_context, stage, terminal):
+        if terminal == "completed" and stage in ("failed_record", "marker_release"):
+            pytest.skip("failure transition stage")
         # A real exit bypasses all enqueue/claim/terminal exception handlers.
         if "fork" not in multiprocessing.get_all_start_methods():
             pytest.skip("fork required to share the recording memory backend")
@@ -994,6 +1031,7 @@ class TestReviewQueueDurability:
             storage.list_keys = lambda prefix: sorted(key for key in storage._objects.keys() if key.startswith(prefix))
 
             def child():
+                in_retention = False
                 queue = IncidentQueue(storage)
                 conditional, put, delete = storage.put_json_if_absent, storage.put_json, storage.delete
 
@@ -1010,17 +1048,24 @@ class TestReviewQueueDurability:
 
                 def put_crash(key, data):
                     result = put(key, data)
-                    if ((stage == "processing" and data.get("status") == "processing")
+                    if ((stage == "failed_record" and "/queue/failed/" in key)
+                            or (stage == "retention_fence" and terminal == "completed" and "/review_claims/" in key and data.get("status") == "completed")
+                            or (stage == "retention_record" and terminal == "completed" and "/review_dedupe/" in key and "context" not in data)
+                            or (stage == "processing" and data.get("status") == "processing")
                             or (stage == "terminal" and "/review_dedupe/" in key and data.get("status") == terminal)
                             or (stage == "fence" and "/review_claims/" in key and data.get("status") == terminal)):
                         os._exit(19)
                     return result
 
                 def delete_crash(key):
+                    if terminal == "failed" and stage.startswith("retention_") and not in_retention and "/queue/pending/" in key:
+                        raise RuntimeError("index cleanup before retention")
                     result = delete(key)
-                    if ((stage in ("delete", "retention_index") and "/queue/pending/" in key)
-                            or (stage == "retention_fence" and "/review_claims/" in key)
-                            or (stage == "retention_marker" and "/review_dedupe/" in key)):
+                    if ((stage == "delete" and "/queue/pending/" in key)
+                            or (in_retention and stage == "retention_index" and "/queue/pending/" in key)
+                            or (in_retention and stage == "retention_fence" and "/review_claims/" in key)
+                            or (stage == "marker_release" and "/review_dedupe/" in key)
+                            or (in_retention and stage == "retention_record" and "/queue/failed/" in key)):
                         os._exit(19)
                     return result
 
@@ -1030,13 +1075,23 @@ class TestReviewQueueDurability:
                 incident_id = queue.enqueue("tenant", review_context)
                 assert queue.claim_next("tenant") is not None
                 if stage.startswith("retention_"):
-                    marker_key = storage.review_dedupe_key("tenant", incident_id)
-                    entry = storage.get_json(marker_key)
+                    if terminal == "failed":
+                        failure = None
+                        try:
+                            queue.mark_failed("tenant", incident_id, "unavailable")
+                        except RuntimeError as error:
+                            failure = error
+                        assert str(failure) == "index cleanup before retention"
+                        record_key = storage.queue_key("tenant", "failed", incident_id)
+                    else:
+                        record_key = _review_marker_key(storage, "tenant", incident_id)
+                    entry = storage.get_json(record_key)
                     entry["status"] = terminal
                     entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
-                    storage.put_json(marker_key, entry)
+                    storage.put_json(record_key, entry)
                     store = IncidentStore(storage)
                     store.retention_days = 1
+                    in_retention = True
                     store.apply_retention("tenant")
                 elif terminal == "completed":
                     queue.mark_completed("tenant", incident_id, {})
@@ -1048,6 +1103,19 @@ class TestReviewQueueDurability:
             process.join(timeout=15)
             assert process.exitcode == 19
             restarted = IncidentQueue(storage)
+            if terminal == "failed" and stage == "marker_release":
+                failed_key = storage.list_keys("tenant/queue/failed/")[0]
+                failed = storage.get_json(failed_key)
+                failed["failed_at"] = "2020-01-01T00:00:00+00:00"
+                storage.put_json(failed_key, failed)
+                store = IncidentStore(storage)
+                store.retention_days = 1
+                store.apply_retention("tenant")
+                assert restarted.claim_next("tenant") is None
+            if terminal == "failed" and stage.startswith("retention_"):
+                store = IncidentStore(storage)
+                store.retention_days = 1
+                store.apply_retention("tenant")
             recovered = restarted.recover_stale_processing("tenant")
             if stage in ("claim", "processing"):
                 assert recovered == 1
@@ -1059,12 +1127,13 @@ class TestReviewQueueDurability:
             incident_id = restarted.enqueue("tenant", review_context)
             assert restarted.enqueue("tenant", review_context) == incident_id
             claimed = claimed_before_retry or restarted.claim_next("tenant")
-            if stage in ("terminal", "fence", "delete", "retention_index", "retention_fence"):
+            if terminal == "completed" and stage in ("terminal", "fence", "delete", "retention_index", "retention_fence", "retention_record"):
                 assert claimed is None
-                marker = storage.get_json(storage.review_dedupe_key("tenant", incident_id))
+                marker = storage.get_json(_review_marker_key(storage, "tenant", incident_id))
                 assert marker["status"] == terminal
-                assert marker["context"] == review_context
-                assert storage.list_keys("tenant/queue/") == []
+                if "context" in marker:
+                    assert marker["context"] == review_context
+                assert storage.list_keys("tenant/queue/pending/") == []
             else:
                 assert claimed is not None
                 assert claimed["incident_id"] == incident_id
@@ -1079,7 +1148,7 @@ class TestReviewQueueDurability:
         storage = MemoryStorage()
         queue = IncidentQueue(storage)
         incident_id = queue.enqueue("tenant", review_context)
-        marker_key = storage.review_dedupe_key("tenant", incident_id)
+        marker_key = _review_marker_key(storage, "tenant", incident_id)
         if held == "processing_recovery":
             assert queue.claim_next("tenant") is not None
         get = storage.get_json
@@ -1104,22 +1173,35 @@ class TestReviewQueueDurability:
                         assert queue.claim_next("tenant") is not None
                     if terminal == "completed":
                         queue.mark_completed("tenant", incident_id, {})
+                        for key in (marker_key, storage.review_claim_key("tenant", incident_id)):
+                            entry = get(key)
+                            entry["completed_at"] = "2020-01-01T00:00:00+00:00"
+                            storage.put_json(key, entry)
+                        assert IncidentStore(storage).apply_retention("tenant") == 0
+                        assert get(marker_key)["status"] == "completed"
+                        assert "context" not in get(marker_key)
+                        assert queue.enqueue("tenant", review_context) == incident_id
                     else:
                         queue.mark_failed("tenant", incident_id, "unavailable")
-                    assert IncidentStore(storage).apply_retention("tenant") == 0
-                    assert queue.enqueue("tenant", review_context) == incident_id
-                    # Both the record and the fence are ordinary ageable objects.
-                    for key in storage.list_keys("tenant/review_dedupe/") + storage.list_keys("tenant/review_claims/"):
-                        entry = get(key)
-                        entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
-                        storage.put_json(key, entry)
-                    assert IncidentStore(storage).apply_retention("tenant") == 2
+                        assert not storage.exists(marker_key)
+                        failed_key = storage.queue_key("tenant", "failed", incident_id)
+                        failed = get(failed_key)
+                        assert failed["context"] == review_context
+                        failed["failed_at"] = "2020-01-01T00:00:00+00:00"
+                        storage.put_json(failed_key, failed)
+                        # A new attempt must survive the old claimant/recovery snapshot.
+                        retry_id = queue.enqueue("tenant", review_context)
+                        assert retry_id != incident_id
+                        assert IncidentStore(storage).apply_retention("tenant") == 1
                     assert IncidentStore(storage).apply_retention("tenant") == 0
                 finally:
                     release.set()
                 assert stale.result(timeout=10) == (None if held == "pending_claim" else 0)
-        assert storage.list_keys("tenant/queue/") == []
-        # Keep live pending/processing reviews even if their creation date is old.
+        if terminal == "failed":
+            assert not storage.exists(storage.review_claim_key("tenant", incident_id))
+            assert queue.claim_next("tenant")["incident_id"] == retry_id
+            queue.mark_completed("tenant", retry_id, {})
+        assert storage.list_keys("tenant/queue/pending/") == []
         for state in ("processing", "pending"):
             context = {**review_context, "head_sha": state}
             live_id = queue.enqueue("tenant", context)
@@ -1188,7 +1270,7 @@ class TestReviewQueueDurability:
         assert len(set(ids)) == 1
         # Hold the winner's final pending snapshot while a second caller claims.
         get = storage.get_json
-        marker_key = storage.review_dedupe_key("tenant", ids[0])
+        marker_key = _review_marker_key(storage, "tenant", ids[0])
         snapshot_taken, release_snapshot = threading.Event(), threading.Event()
         owner_thread = None
         counts = {}
@@ -1235,11 +1317,10 @@ def test_gitlab_terminal_state_never_enqueues(gitlab_request, gitlab_payload, ac
 
 @pytest.mark.parametrize("terminal", ["completed", "failed"])
 def test_terminal_cleanup_retries_from_durable_context(monkeypatch, review_context, terminal):
-    monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
     storage = MemoryStorage()
     queue = IncidentQueue(storage)
     incident_id = queue.enqueue("tenant", review_context)
-    queue.claim_next("tenant")
+    marker_key = queue.claim_next("tenant")["review_key"]
     put = storage.put_json
     def fail_fence(key, data):
         if "/review_claims/" in key:
@@ -1259,12 +1340,14 @@ def test_terminal_cleanup_retries_from_durable_context(monkeypatch, review_conte
     assert queue.enqueue("tenant", review_context) == incident_id
     if terminal == "completed":
         queue.mark_completed("tenant", incident_id, {})
+        assert storage.get_json(marker_key).get("context") == review_context
     else:
         queue.mark_failed("tenant", incident_id, "unavailable")
-    marker_key = storage.review_dedupe_key("tenant", incident_id)
-    assert storage.get_json(marker_key).get("context") == review_context
+        assert not storage.exists(marker_key)
+        failed_key = storage.queue_key("tenant", "failed", incident_id)
+        assert storage.get_json(failed_key).get("context") == review_context
     assert queue.claim_next("tenant") is None
-    assert storage.list_keys("tenant/queue/") == []
+    assert storage.list_keys("tenant/queue/pending/") == []
 
 
 @pytest.mark.parametrize("terminal", ["completed", "failed"])
@@ -1273,15 +1356,27 @@ def test_retention_cleans_interrupted_terminal_transition(monkeypatch, review_co
     storage = MemoryStorage()
     queue = IncidentQueue(storage)
     incident_id = queue.enqueue("tenant", review_context)
-    queue.claim_next("tenant")
-    # A terminal marker landed; the process stopped before updating its fence/index.
-    marker_key = storage.review_dedupe_key("tenant", incident_id)
+    marker_key = queue.claim_next("tenant")["review_key"]
     entry = storage.get_json(marker_key)
     entry.update(status=terminal)
     entry["completed_at" if terminal == "completed" else "failed_at"] = "2020-01-01T00:00:00+00:00"
+    if terminal == "failed":
+        storage.put_json(storage.queue_key("tenant", "failed", incident_id), entry)
     storage.put_json(marker_key, entry)
-    assert IncidentStore(storage).apply_retention("tenant") == 3
-    assert storage.list_keys("tenant/") == []
+    deleted = IncidentStore(storage).apply_retention("tenant")
+    if terminal == "completed":
+        assert deleted == 1
+        assert storage.get_json(marker_key)["status"] == "completed"
+        assert "context" not in storage.get_json(marker_key)
+        assert queue.enqueue("tenant", review_context) == incident_id
+    else:
+        assert deleted == 0
+        assert storage.get_json(marker_key)["status"] == "failed"
+        assert storage.exists(storage.queue_key("tenant", "failed", incident_id))
+        assert queue.recover_stale_processing("tenant") == 0
+        assert IncidentStore(storage).apply_retention("tenant") == 1
+        assert storage.list_keys("tenant/") == []
+    assert storage.list_keys("tenant/queue/pending/") == []
     assert queue.claim_next("tenant") is None
 
 
@@ -1299,10 +1394,12 @@ def test_legacy_record_replay_requires_published_active_work(monkeypatch, review
     storage = MemoryStorage()
     queue = IncidentQueue(storage)
     incident_id = queue.enqueue("tenant", review_context)
-    marker = storage.get_json(storage.review_dedupe_key("tenant", incident_id))
+    marker = storage.get_json(_review_marker_key(storage, "tenant", incident_id))
     # Match pre-upgrade records, which have no index/reference field.
     storage._objects.clear()
-    marker.pop("review_key")
+    marker_key = marker.pop("review_key")
+    incident_id = marker_key.rsplit("/", 1)[-1].removesuffix(".json")
+    marker["incident_id"] = incident_id
     marker["status"] = status
     storage.put_json(storage.queue_key("tenant", "reviews", incident_id), marker)
     def fail_index(key, data):
@@ -1345,12 +1442,14 @@ def test_retention_aborts_on_s3_fence_head_failure(monkeypatch, review_context):
     storage = MemoryStorage()
     queue = IncidentQueue(storage)
     incident_id = queue.enqueue("tenant", review_context)
-    queue.claim_next("tenant")
-    queue.mark_completed("tenant", incident_id, {})
-    marker_key = storage.review_dedupe_key("tenant", incident_id)
-    entry = storage.get_json(marker_key)
-    entry["completed_at"] = "2020-01-01T00:00:00+00:00"
-    storage.put_json(marker_key, entry)
+    marker_key = queue.claim_next("tenant")["review_key"]
+    queue.mark_failed("tenant", incident_id, "unavailable")
+    failed_key = storage.queue_key("tenant", "failed", incident_id)
+    entry = storage.get_json(failed_key)
+    entry["failed_at"] = "2020-01-01T00:00:00+00:00"
+    storage.put_json(failed_key, entry)
+    retry_id = queue.enqueue("tenant", review_context)
+    retry_marker = storage.get_json(marker_key)
     remove = storage.delete
     fail_head = True
 
@@ -1377,9 +1476,498 @@ def test_retention_aborts_on_s3_fence_head_failure(monkeypatch, review_context):
     except TimeoutError as error:
         failure = error
     assert failure is not None
-    assert storage.get_json(marker_key) == entry
-    assert queue.enqueue("tenant", review_context) == incident_id
-    assert queue.claim_next("tenant") is None
+    assert storage.get_json(failed_key) == entry
+    assert storage.get_json(marker_key) == retry_marker
+    assert queue.enqueue("tenant", review_context) == retry_id
+    claimed = queue.claim_next("tenant")
+    assert claimed and claimed["incident_id"] == retry_id
+    queue.mark_completed("tenant", retry_id, {})
     fail_head = False
-    assert IncidentStore(storage).apply_retention("tenant") == 2
-    assert storage.list_keys("tenant/") == []
+    assert IncidentStore(storage).apply_retention("tenant") == 1
+    assert not storage.exists(failed_key)
+    assert storage.get_json(marker_key)["status"] == "completed"
+    assert storage.list_keys("tenant/queue/") == []
+
+
+class TestReviewFailureRetry:
+    @pytest.mark.parametrize("terminal", ["failed", "completed"])
+    def test_terminal_policy_through_bitbucket_webhook(
+        self, bitbucket_request, bitbucket_payload, review_queue, terminal
+    ):
+        first = bitbucket_request(bitbucket_payload)
+        assert first.status_code == 200
+        incident_id = first.json()["incident_id"]
+        assert review_queue.claim_next("tenant-ember")["incident_id"] == incident_id
+        if terminal == "failed":
+            review_queue.mark_failed("tenant-ember", incident_id, "review unavailable")
+        else:
+            review_queue.mark_completed("tenant-ember", incident_id, {})
+        second = bitbucket_request(bitbucket_payload, "pullrequest:updated")
+        third = bitbucket_request(bitbucket_payload, "pullrequest:updated")
+        assert second.status_code == third.status_code == 200
+        assert second.json() == third.json()
+        claimed = review_queue.claim_next("tenant-ember")
+        if terminal == "failed":
+            assert claimed is not None
+            assert claimed["incident_id"] == second.json()["incident_id"] != incident_id
+            assert claimed["context"]["head_sha"] == "commit-juniper"
+            failed = review_queue.storage.get_json(
+                review_queue.storage.queue_key("tenant-ember", "failed", incident_id)
+            )
+            assert failed and failed["status"] == "failed"
+            assert failed["error"] == "review unavailable"
+        else:
+            assert claimed is None
+            assert second.json() == first.json()
+        assert review_queue.claim_next("tenant-ember") is None
+
+    @pytest.mark.parametrize("terminal", ["failed", "completed"])
+    def test_terminal_policy_direct_gitlab_concurrent_deliveries(self, review_context, terminal):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        context = {**review_context, "scm_platform": "gitlab"}
+        incident_id = queue.enqueue("tenant", context)
+        assert queue.claim_next("tenant")["incident_id"] == incident_id
+        if terminal == "failed":
+            queue.mark_failed("tenant", incident_id, "unavailable")
+        else:
+            queue.mark_completed("tenant", incident_id, {})
+        with ThreadPoolExecutor(max_workers=8) as executor:
+            ids = list(executor.map(lambda _: queue.enqueue("tenant", context), range(8)))
+        assert len(set(ids)) == 1
+        assert queue.enqueue("tenant", context) == ids[0]
+        claimed = queue.claim_next("tenant")
+        if terminal == "failed":
+            assert claimed is not None
+            assert claimed["incident_id"] == ids[0] != incident_id
+            assert claimed["context"] == context
+        else:
+            assert claimed is None
+            assert ids[0] == incident_id
+        assert queue.claim_next("tenant") is None
+
+    @pytest.mark.parametrize("resume", ["transition", "recovery"])
+    def test_failed_marker_delete_error_keeps_failed_record_and_dedupe(self, monkeypatch, review_context, resume):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        incident_id = queue.enqueue("tenant", review_context)
+        claimed = queue.claim_next("tenant")
+        marker_key = claimed["review_key"]
+        failed_key = storage.queue_key("tenant", "failed", incident_id)
+        delete = storage.delete
+
+        def fail_marker_delete(key):
+            if key == marker_key:
+                raise RuntimeError("marker delete unavailable")
+            return delete(key)
+
+        failure = None
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "delete", fail_marker_delete)
+            try:
+                queue.mark_failed("tenant", incident_id, "review unavailable")
+            except RuntimeError as error:
+                failure = error
+        assert failure is not None
+        assert str(failure) == "marker delete unavailable"
+        failed = storage.get_json(failed_key)
+        assert failed and failed["status"] == "failed"
+        assert failed["context"] == review_context
+        assert failed["error"] == "review unavailable"
+        assert storage.exists(marker_key)
+        assert storage.get_json(marker_key)["status"] == "failed"
+        assert queue.enqueue("tenant", review_context) == incident_id
+        assert queue.claim_next("tenant") is None
+        # Retry cleanup using persisted failure after the processing fence is gone.
+        if resume == "transition":
+            queue.mark_failed("tenant", incident_id, "review unavailable")
+        else:
+            assert queue.recover_stale_processing("tenant") == 0
+        assert not storage.exists(marker_key)
+        assert storage.get_json(failed_key) == failed
+        retry_id = queue.enqueue("tenant", review_context)
+        assert queue.enqueue("tenant", review_context) == retry_id
+        assert queue.claim_next("tenant")["incident_id"] == retry_id != incident_id
+        assert queue.claim_next("tenant") is None
+
+    def test_failed_record_write_precedes_marker_delete(self, monkeypatch, review_context):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        incident_id = queue.enqueue("tenant", review_context)
+        marker_key = queue.claim_next("tenant")["review_key"]
+        failed_key = storage.queue_key("tenant", "failed", incident_id)
+        put, delete = storage.put_json, storage.delete
+        order = []
+
+        def record_write(key, data):
+            result = put(key, data)
+            if key == failed_key:
+                order.append("failed persisted")
+            return result
+
+        def record_delete(key):
+            if key == marker_key:
+                failed = storage.get_json(failed_key) or {}
+                assert failed.get("status") == "failed"
+                assert failed.get("context") == review_context
+                order.append("marker deleted")
+            return delete(key)
+
+        monkeypatch.setattr(storage, "put_json", record_write)
+        monkeypatch.setattr(storage, "delete", record_delete)
+        queue.mark_failed("tenant", incident_id, "unavailable")
+        assert order == ["failed persisted", "marker deleted"]
+        assert storage.get_json(failed_key)["error"] == "unavailable"
+        assert not storage.exists(marker_key)
+
+    def test_old_failed_transition_cannot_release_new_attempt(self, review_context):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        queue.claim_next("tenant")
+        queue.mark_failed("tenant", old_id, "first failure")
+        new_id = queue.enqueue("tenant", review_context)
+        assert new_id != old_id
+        # A retry of the old transition must retain the new reservation and work.
+        queue.mark_failed("tenant", old_id, "first failure")
+        assert queue.enqueue("tenant", review_context) == new_id
+        claimed = queue.claim_next("tenant")
+        assert claimed and claimed["incident_id"] == new_id
+        queue.mark_failed("tenant", old_id, "first failure")
+        assert queue.enqueue("tenant", review_context) == new_id
+        assert queue.claim_next("tenant") is None
+        assert storage.get_json(storage.queue_key("tenant", "failed", old_id))["error"] == "first failure"
+
+    def test_non_review_failure_keeps_original_queue_behavior(self, monkeypatch):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        context = {"type": "server", "host": "203.0.113.7"}
+        incident_id = queue.enqueue("tenant", context)
+        claimed = queue.claim_next("tenant")
+        deletes = []
+        delete = storage.delete
+        def record_delete(key):
+            deletes.append(key)
+            return delete(key)
+        monkeypatch.setattr(storage, "delete", record_delete)
+        queue.mark_failed("tenant", incident_id, "unavailable")
+        failed = storage.get_json(storage.queue_key("tenant", "failed", incident_id))
+        assert failed["context"] == context
+        assert failed["attempts"] == claimed["attempts"]
+        assert failed["status"] == "failed" and failed["error"] == "unavailable"
+        assert deletes == [storage.queue_key("tenant", "processing", incident_id)]
+        assert storage.list_keys("tenant/review_dedupe/") == []
+        assert storage.list_keys("tenant/review_claims/") == []
+        assert queue.claim_next("tenant") is None
+
+    def test_completed_head_dedupes_after_retention(self, monkeypatch, review_context):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        incident_id = queue.enqueue("tenant", review_context)
+        marker_key = queue.claim_next("tenant")["review_key"]
+        queue.mark_completed("tenant", incident_id, {})
+        for key in (marker_key, storage.review_claim_key("tenant", incident_id)):
+            entry = storage.get_json(key)
+            entry["completed_at"] = "2020-01-01T00:00:00+00:00"
+            storage.put_json(key, entry)
+        ordinary_key = storage.queue_key("tenant", "completed", "INC-expired")
+        storage.put_json(ordinary_key, {"completed_at": "2020-01-01T00:00:00+00:00"})
+        IncidentStore(storage).apply_retention("tenant")
+        assert not storage.exists(ordinary_key)
+        assert storage.exists(marker_key)
+        assert queue.enqueue("tenant", review_context) == incident_id
+        assert queue.enqueue("tenant", review_context) == incident_id
+        assert queue.claim_next("tenant") is None
+        assert queue.recover_stale_processing("tenant") == 0
+
+
+    def test_stale_failed_index_cannot_resurrect_released_marker(self, monkeypatch, review_context):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        index_key = storage.queue_key("tenant", "pending", old_id)
+        marker_key = storage.get_json(index_key)["review_key"]
+        get = storage.get_json
+        taken, release = threading.Event(), threading.Event()
+
+        def hold_index(key):
+            entry = get(key)
+            if key == index_key and entry and not taken.is_set():
+                taken.set()
+                assert release.wait(10)
+            return entry
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", hold_index)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                stale = executor.submit(queue.claim_next, "tenant")
+                try:
+                    assert taken.wait(10)
+                    assert queue.claim_next("tenant")["incident_id"] == old_id
+                    queue.mark_failed("tenant", old_id, "unavailable")
+                    assert not storage.exists(marker_key)
+                finally:
+                    release.set()
+                assert stale.result(timeout=10) is None
+        assert not storage.exists(marker_key)
+        new_id = queue.enqueue("tenant", review_context)
+        assert queue.enqueue("tenant", review_context) == new_id != old_id
+        assert queue.claim_next("tenant")["incident_id"] == new_id
+        assert queue.claim_next("tenant") is None
+
+
+    def test_delayed_publisher_cannot_resurrect_failed_marker(self, monkeypatch, review_context):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        put = storage.put_json_if_absent
+        waiting, release = threading.Event(), threading.Event()
+
+        def hold_marker(key, data):
+            if "/review_dedupe/" in key and not waiting.is_set():
+                waiting.set()
+                assert release.wait(10)
+            return put(key, data)
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", hold_marker)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                publisher = executor.submit(queue.enqueue, "tenant", review_context)
+                try:
+                    assert waiting.wait(10)
+                    early = queue.claim_next("tenant")
+                    if early:
+                        queue.mark_failed("tenant", early["incident_id"], "unavailable")
+                finally:
+                    release.set()
+                old_id = publisher.result(timeout=10)
+        if not early:
+            later = queue.claim_next("tenant")
+            assert later is not None
+            assert later["incident_id"] == old_id
+            queue.mark_failed("tenant", old_id, "unavailable")
+        new_id = queue.enqueue("tenant", review_context)
+        assert new_id != old_id
+        assert queue.enqueue("tenant", review_context) == new_id
+        assert queue.claim_next("tenant")["incident_id"] == new_id
+        assert queue.claim_next("tenant") is None
+
+    def test_stale_failure_read_cannot_recreate_marker(self, monkeypatch, review_context):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        marker_key = _review_marker_key(storage, "tenant", old_id)
+        failed_key = storage.queue_key("tenant", "failed", old_id)
+        get = storage.get_json
+        waiting, release = threading.Event(), threading.Event()
+
+        def hold_failure_read(key):
+            entry = get(key)
+            if key == failed_key and entry is None and not waiting.is_set():
+                waiting.set()
+                assert release.wait(10)
+            return entry
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", hold_failure_read)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                stale = executor.submit(queue.claim_next, "tenant")
+                try:
+                    assert waiting.wait(10)
+                    assert queue.claim_next("tenant")["incident_id"] == old_id
+                    queue.mark_failed("tenant", old_id, "unavailable")
+                finally:
+                    release.set()
+                assert stale.result(timeout=10) is None
+        assert not storage.exists(marker_key)
+        new_id = queue.enqueue("tenant", review_context)
+        assert queue.enqueue("tenant", review_context) == new_id != old_id
+        assert queue.claim_next("tenant")["incident_id"] == new_id
+        assert queue.claim_next("tenant") is None
+
+    @pytest.mark.parametrize("new_attempt", [False, True])
+    def test_expired_failed_attempt_cleans_own_stale_index(self, monkeypatch, review_context, new_attempt):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        marker_key = queue.claim_next("tenant")["review_key"]
+        index_key = storage.queue_key("tenant", "pending", old_id)
+        failed_key = storage.queue_key("tenant", "failed", old_id)
+        delete = storage.delete
+
+        def stop_index_cleanup(key):
+            if key == index_key:
+                raise RuntimeError("index cleanup interrupted")
+            return delete(key)
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "delete", stop_index_cleanup)
+            with pytest.raises(RuntimeError, match="index cleanup interrupted"):
+                queue.mark_failed("tenant", old_id, "unavailable")
+        assert not storage.exists(marker_key)
+        assert storage.exists(index_key)
+        failed = storage.get_json(failed_key)
+        failed["failed_at"] = "2020-01-01T00:00:00+00:00"
+        storage.put_json(failed_key, failed)
+        if new_attempt:
+            retry_id = queue.enqueue("tenant", review_context)
+            assert retry_id != old_id
+        IncidentStore(storage).apply_retention("tenant")
+        assert not storage.exists(index_key)
+        assert not storage.exists(failed_key)
+        assert queue.recover_stale_processing("tenant") == 0
+        claimed = queue.claim_next("tenant")
+        if new_attempt:
+            assert claimed and claimed["incident_id"] == retry_id
+        else:
+            assert claimed is None
+            retry_id = queue.enqueue("tenant", review_context)
+            assert queue.enqueue("tenant", review_context) == retry_id != old_id
+            assert queue.claim_next("tenant")["incident_id"] == retry_id
+        assert queue.claim_next("tenant") is None
+
+    @pytest.mark.parametrize("cleanup", ["index", "fence"])
+    def test_failed_history_expiry_preserves_evidence_on_cleanup_error(self, monkeypatch, review_context, cleanup):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        entry = queue.claim_next("tenant")
+        index_key = storage.queue_key("tenant", "pending", old_id)
+        remove = storage.delete
+        def stop_index_cleanup(key):
+            if key == index_key:
+                raise RuntimeError("index cleanup interrupted")
+            return remove(key)
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "delete", stop_index_cleanup)
+            with pytest.raises(RuntimeError, match="index cleanup interrupted"):
+                queue.mark_failed("tenant", old_id, "unavailable")
+        failed_key = storage.queue_key("tenant", "failed", old_id)
+        failed = storage.get_json(failed_key)
+        failed["failed_at"] = "2020-01-01T00:00:00+00:00"
+        storage.put_json(failed_key, failed)
+        target = (storage.queue_key("tenant", "pending", old_id) if cleanup == "index"
+                  else storage.review_claim_key("tenant", old_id))
+        delete = storage.delete
+
+        def fail_cleanup(key):
+            if key == target:
+                raise RuntimeError("failed cleanup unavailable")
+            return delete(key)
+
+        failure = None
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "delete", fail_cleanup)
+            try:
+                IncidentStore(storage).apply_retention("tenant")
+            except RuntimeError as error:
+                failure = error
+        assert failure is not None
+        assert storage.get_json(failed_key) == failed
+        IncidentStore(storage).apply_retention("tenant")
+        assert not storage.exists(failed_key)
+        assert not storage.exists(entry["review_key"])
+        assert queue.claim_next("tenant") is None
+
+
+    @pytest.mark.parametrize("terminal", ["failed", "completed"])
+    def test_delayed_pending_publish_retires_terminal_index(self, monkeypatch, review_context, terminal):
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        put = storage.put_json_if_absent
+        waiting, release = threading.Event(), threading.Event()
+
+        def hold_pending(key, data):
+            if "/queue/pending/" in key and not waiting.is_set():
+                waiting.set()
+                assert release.wait(10)
+            return put(key, data)
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "put_json_if_absent", hold_pending)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                publisher = executor.submit(queue.enqueue, "tenant", review_context)
+                try:
+                    assert waiting.wait(10)
+                    old_id = queue.enqueue("tenant", review_context)
+                    assert queue.claim_next("tenant")["incident_id"] == old_id
+                    if terminal == "failed":
+                        queue.mark_failed("tenant", old_id, "unavailable")
+                    else:
+                        queue.mark_completed("tenant", old_id, {})
+                finally:
+                    release.set()
+                assert publisher.result(timeout=10) == old_id
+        assert storage.list_keys("tenant/queue/pending/") == []
+        new_id = queue.enqueue("tenant", review_context)
+        assert queue.enqueue("tenant", review_context) == new_id
+        claimed = queue.claim_next("tenant")
+        if terminal == "failed":
+            assert new_id != old_id
+            assert claimed and claimed["incident_id"] == new_id
+        else:
+            assert new_id == old_id
+            assert claimed is None
+        assert queue.claim_next("tenant") is None
+
+
+    @pytest.mark.parametrize("phase", ["failed_history", "head_marker"])
+    def test_retention_snapshot_cannot_delete_new_attempt_marker(self, monkeypatch, review_context, phase):
+        monkeypatch.setenv("AUDIT_RETENTION_DAYS", "1")
+        storage = MemoryStorage()
+        queue = IncidentQueue(storage)
+        old_id = queue.enqueue("tenant", review_context)
+        marker_key = queue.claim_next("tenant")["review_key"]
+        failed_key = storage.queue_key("tenant", "failed", old_id)
+        delete = storage.delete
+
+        def hold_failed_marker(key):
+            if key == marker_key:
+                raise RuntimeError("marker release interrupted")
+            return delete(key)
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "delete", hold_failed_marker)
+            with pytest.raises(RuntimeError, match="marker release interrupted"):
+                queue.mark_failed("tenant", old_id, "unavailable")
+        marker = storage.get_json(marker_key)
+        marker["failed_at"] = "2020-01-01T00:00:00+00:00"
+        storage.put_json(marker_key, marker)
+        if phase == "failed_history":
+            failed = storage.get_json(failed_key)
+            failed["failed_at"] = marker["failed_at"]
+            storage.put_json(failed_key, failed)
+        get = storage.get_json
+        taken, release = threading.Event(), threading.Event()
+
+        reads = 0
+        def snapshot(key):
+            nonlocal reads
+            entry = get(key)
+            if key == marker_key and entry and entry["incident_id"] == old_id and not taken.is_set():
+                reads += 1
+                if reads == (1 if phase == "failed_history" else 2):
+                    taken.set()
+                    assert release.wait(10)
+            return entry
+
+        with monkeypatch.context() as injection:
+            injection.setattr(storage, "get_json", snapshot)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                retention = executor.submit(IncidentStore(storage).apply_retention, "tenant")
+                try:
+                    assert taken.wait(10)
+                    queue.mark_failed("tenant", old_id, "unavailable")
+                    new_id = queue.enqueue("tenant", review_context)
+                    assert new_id != old_id
+                finally:
+                    release.set()
+                retention.result(timeout=10)
+        current = storage.get_json(marker_key) or {}
+        assert current.get("incident_id") == new_id
+        assert queue.enqueue("tenant", review_context) == new_id
+        claimed = queue.claim_next("tenant")
+        assert claimed and claimed["incident_id"] == new_id
+        assert queue.claim_next("tenant") is None
