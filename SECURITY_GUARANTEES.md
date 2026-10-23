@@ -16,7 +16,7 @@
 - The six host-mutating tools require approval for live changes when `AUTO_APPLY=false`; dry runs remain available.
 - Org credentials stored without application-level encryption
 - API keys never logged
-- RBAC (Role-Based Access Control) enforced
+- API access has no application-level RBAC; organization configuration handlers accept the supplied org ID without a role check ([API handlers](api/server.py#L304)).
 
 **Code Security:**
 - No shell injection vulnerabilities
@@ -27,9 +27,9 @@
 
 **Network Security:**
 - TLS/SSL encryption for all communications
-- Webhook authentication required
-- IP whitelist support
-- API key authentication
+- Webhook authentication is checked when `WEBHOOK_SECRET` is configured ([webhook gate](api/server.py#L264)).
+- IP filtering must be configured in the deployment network; the API has no IP allowlist middleware ([API application and routes](api/server.py#L250)).
+- Alertmanager and Grafana accept `WEBHOOK_SECRET` as a bearer token or an HMAC signature ([webhook handlers](api/server.py#L468)).
 - Optional VPN/bastion integration
 
 ---
@@ -39,31 +39,21 @@
 **Multiple Security Layers:**
 
 **Layer 1: Authentication**
-```python
-# API Key authentication required
-Authorization: Bearer <your-api-key>
+```bash
+# Configure the shared webhook secret
+WEBHOOK_SECRET=<strong-secret>
 
-# Webhook signature verification
-X-Signature: <HMAC-SHA256>
-
-# IP whitelist
-ALLOWED_IPS=10.0.0.0/8,192.168.1.0/24
+# Configure the separate Slack signing secret
+SLACK_SIGNING_SECRET=<slack-signing-secret>
 ```
+
+With `WEBHOOK_SECRET` set, webhook handlers check HMAC-SHA256 signatures or supported shared-token headers. Alertmanager and Grafana accept bearer tokens; GitLab accepts `X-Gitlab-Token`. These checks accept requests without authentication when the secret is unset ([webhook gate](api/server.py#L264), [Alertmanager/Grafana handlers](api/server.py#L468), [GitLab handler](api/server.py#L536), [verification functions](api/webhook_auth.py#L33)).
+
+Slack actions verify Slack signatures and request timestamps when `SLACK_SIGNING_SECRET` is configured; the check accepts requests when that secret is unset ([Slack handler](api/server.py#L668), [Slack verification](api/webhook_auth.py#L108)).
 
 **Layer 2: Authorization**
-```yaml
-# RBAC configuration
-roles:
-  - name: agent
-    permissions:
-      - read:pods
-      - restart:services
-      - read:logs
-    forbidden:
-      - delete:*
-      - drop:*
-      - format:*
-```
+
+The API has no role-based authorization or general API-key authentication middleware. Organization IDs select stored data; they are not checked against a caller's permissions. Protect API access with deployment-level access controls ([application setup and org handlers](api/server.py#L250), [org document handlers](api/server.py#L317)).
 
 **Layer 3: Encryption**
 
@@ -144,16 +134,16 @@ security_checks = [
 ```
 
 **Compliance Validation:**
-```python
-# Validates against security standards
-compliance_frameworks = [
-    "CIS_Benchmarks",
-    "SOC2",
-    "PCI-DSS",
-    "HIPAA",
-    "GDPR"
-]
+```bash
+# Scanner configuration defaults
+ENABLE_SECURITY_SCANNING=true
+ENABLE_COMPLIANCE_CHECKS=true
+COMPLIANCE_FRAMEWORKS=CIS
 ```
+
+These are environment settings read by [SecurityScanner](collectors/security_scanner.py#L21). When scanning and compliance checks are enabled, `COMPLIANCE_FRAMEWORKS` selects CIS, SOC2/SOC-2, or PCI/PCI-DSS/PCIDSS text checks; other names are ignored ([framework dispatch](collectors/security_scanner.py#L280)).
+
+The scanner uses text matching for privileged-container flags, missing non-root settings, non-local HTTP URLs, possible embedded secrets, and long digit sequences resembling card data. Its CIS path also emits an `allowPrivilegeEscalation` finding; the current predicate retains a space in the search string after removing spaces from the input, so that finding is always emitted. These are advisory findings, not certification or a complete framework assessment ([CIS checks](collectors/security_scanner.py#L297), [SOC2 checks](collectors/security_scanner.py#L332), [PCI checks](collectors/security_scanner.py#L358)).
 
 ---
 
@@ -322,116 +312,69 @@ Monitoring: SIEM integration
 
 ---
 
-## Fix Accuracy Guarantee
+## Fix Accuracy and Verification
 
 ### Will the Fixes Be Accurate?
 
-**YES - Multi-stage verification ensures accuracy.**
+**The agent runs verification when it classifies an action as successful remediation on its normal completion path; verification can fail or report instability** ([agent finalization](agent/core.py#L1096), [verification outcomes](tools/fix_verifier.py#L70)).
 
 **Accuracy Mechanisms:**
 
 **1. AI Analysis (Claude):**
 ```python
-# Agent uses Claude AI to analyze incidents
-analysis = claude.analyze(
-    context={
-        "logs": nginx_logs,
-        "metrics": prometheus_metrics,
-        "history": past_incidents
-    },
-    question="What is the root cause and how to fix it?"
+response = self._anthropic_client().messages.create(
+    model=self.model,
+    max_tokens=4096,
+    system=system_prompt,
+    tools=AGENT_TOOLS,
+    messages=messages,
 )
-
-# Claude provides:
-# - Root cause analysis
-# - Recommended fix
-# - Potential side effects
-# - Verification steps
 ```
 
-**2. Confidence Scoring:**
-```python
-if analysis.confidence < 0.8:
-    # Low confidence, send to human
-    send_email("Manual review required")
-else:
-    # High confidence, auto-fix
-    execute_fix()
-```
+The agent sends collected incident context and available organization documentation to Claude, then processes tool calls and final text ([context preparation](agent/core.py#L1052), [Claude API call](agent/core.py#L1199)).
+
+**2. Evidence Checks:**
+
+The agent checks final responses with `validate_resolution`, which checks tool evidence and remediation or suggestions for supported incident types. It can request further evidence before returning; this is not a numeric confidence score ([grounding checks](agent/grounding.py#L152), [retry and completion logic](agent/core.py#L1096)).
 
 **3. Immediate Verification:**
 ```python
-# After fix applied
-verification = verify_fix(
-    expected_state={
-        "service": "running",
-        "health": "200 OK",
-        "errors": "none"
-    }
+verification = await self.fix_verifier.verify_fix(
+    incident_type=issue_type,
+    fix_applied=_remediation_summary(actions_taken),
+    expected_state=_verification_expected_state(issue_type, context),
+    monitoring_duration=FIX_VERIFICATION_MONITORING_SECONDS,
 )
-
-if not verification.passed:
-    # Fix failed, rollback
-    rollback()
-    send_email("Fix failed, rolled back")
 ```
+
+This call runs when `has_successful_remediation` reports an applied action at normal completion; suggestions alone do not trigger it ([agent finalization](agent/core.py#L1110), [remediation predicate](agent/grounding.py#L139)). Checks dispatch by incident type to Kubernetes, CI/CD, server, cloud, or ArgoCD verification. Unsupported types and missing required target information fail verification ([check dispatch](tools/fix_verifier.py#L126), [target checks](tools/fix_verifier.py#L229)).
 
 **4. Stability Monitoring:**
-```python
-# Monitor for 5 minutes
-stability = monitor_stability(
-    duration=300,
-    interval=30,
-    checks=[
-        "service_running",
-        "no_errors_in_logs",
-        "response_time_normal",
-        "error_rate_low"
-    ]
-)
 
-if stability.success_rate < 0.9:
-    send_alert("Fix unstable, needs review")
-```
+After immediate checks pass, `FixVerifier` repeats the same target checks over the configured window. The agent requests 300 seconds; monitoring can stop early after repeated failed observations. The verifier reports success when at least 90% of its observations pass, and rejects non-positive monitoring durations. This percentage describes one verification window, not historical fix accuracy ([agent window](agent/core.py#L878), [monitoring implementation](tools/fix_verifier.py#L162)).
 
-**5. Rollback on Failure:**
-```python
-if fix_failed or not_stable:
-    # Automatic rollback
-    rollback_to_previous_state()
-    
-    # Notify team
-    send_email(
-        subject="Fix failed, rolled back",
-        details=failure_reason
-    )
-```
+**5. Failure Reporting and Rollback Tools:**
+
+The agent saves the verification result and sends a Slack message, using warning severity when verification fails. This completion path does not automatically roll back a failed or unstable fix ([result handling](agent/core.py#L1124)). Kubernetes, ArgoCD, and Helm rollback tools are separate actions available to the agent ([tool dispatch](agent/core.py#L1451), [ArgoCD dispatch](agent/core.py#L1530), [Helm dispatch](agent/core.py#L1550)).
 
 ---
 
 ## Historical Accuracy
 
-**Based on Testing:**
+**Available Verification Records:**
 
-| Fix Type | Success Rate | Auto-Fixed | Manual Review Required |
-|----------|--------------|------------|------------------------|
-| Service Restart | 99.5% | Yes | No |
-| Config Reload | 98.0% | Yes | No |
-| Timeout Increase | 97.5% | Yes | No |
-| Permission Fix | 96.0% | Yes | No |
-| Resource Limit | 95.5% | Yes | No |
-| Disk Cleanup | 99.0% | Yes | No |
-| Cache Clear | 99.8% | Yes | No |
-| Log Rotation | 99.9% | Yes | No |
+| Record | Source | Meaning | Limitation |
+|--------|--------|---------|------------|
+| Immediate checks | [FixVerifier](tools/fix_verifier.py#L101) | Target checks passed or failed | Depends on incident type and target information |
+| Stability observations | [Monitoring result](tools/fix_verifier.py#L162) | Passing observations within one monitoring window | Not a historical fix-success rate |
+| Incident result | [Agent result](agent/core.py#L1135) | Remediation, grounding, and verification recorded separately | `resolved` is computed before verification and is not gated by its result |
 
-**Overall Success Rate: 98.5%**
+**Overall Success Rate:** The repository provides no measurement source for an overall or per-fix-type accuracy percentage. The implemented `success_rate` is the fraction of passing stability observations within one verification window ([calculation](tools/fix_verifier.py#L216)).
 
 **When Fix Fails:**
-- Automatic rollback
-- Email to SRE team
-- Detailed failure analysis
-- Manual steps provided
-- No system damage
+- Failed immediate checks return `status="failed"`; failed stability monitoring returns `status="unstable"` ([verification results](tools/fix_verifier.py#L101)).
+- Verification results are saved and sent to Slack; the agent's result includes verification separately from `resolved` ([agent result handling](agent/core.py#L1124)).
+- Review the result before deciding on further remediation; automatic rollback is not part of this verification path ([agent finalization](agent/core.py#L1124)).
 
 ---
 
@@ -448,12 +391,14 @@ ENABLE_AUDIT_LOGGING=true
 ENABLE_EMAIL_ALERTS=true
 
 # Set up authentication
-API_KEY=<strong-random-key>
 WEBHOOK_SECRET=<strong-secret>
+SLACK_SIGNING_SECRET=<slack-signing-secret>
 
 # Configure encryption
 TLS_ENABLED=true
 ```
+
+Webhook and Slack authentication use these separate secrets; setting `API_KEY` does not protect API routes ([webhook gate](api/server.py#L264), [Slack verification](api/webhook_auth.py#L108), [API application](api/server.py#L250)).
 
 `ENCRYPT_CREDENTIALS` is not read by the application and does not enable credential encryption.
 
@@ -508,15 +453,13 @@ SIEM_ENDPOINT=https://siem.company.com
 
 ## Security Certifications
 
-**Agent Complies With:**
+**Implemented Advisory Checks:**
 
-- **SOC 2 Type II** - Security and availability controls
-- **ISO 27001** - Information security management
-- **CIS Benchmarks** - Security configuration standards
-- **NIST Cybersecurity Framework** - Risk management
-- **GDPR** - Data protection and privacy
-- **PCI-DSS** - Payment card security (if applicable)
-- **HIPAA** - Healthcare data security (if applicable)
+- **CIS-oriented configuration findings** - Text checks for privileged and non-root container settings and an `allowPrivilegeEscalation` finding ([CIS checks](collectors/security_scanner.py#L297)).
+- **SOC2-oriented configuration findings** - Non-local HTTP endpoints and possible secrets embedded in configuration ([SOC2 checks](collectors/security_scanner.py#L332)).
+- **PCI-DSS-oriented configuration findings** - Long digit sequences resembling card data and non-local HTTP endpoints ([PCI checks](collectors/security_scanner.py#L358)).
+
+These findings do not establish SOC 2 Type II, ISO 27001, CIS, NIST CSF, GDPR, PCI-DSS, or HIPAA compliance or certification. The scanner selects only the CIS, SOC2, and PCI-labelled checks above; it ignores other framework names ([framework dispatch](collectors/security_scanner.py#L280)).
 
 ---
 
@@ -565,9 +508,9 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 **YES.**
 
 - Enterprise-grade security
-- Multiple authentication layers
+- Webhook HMAC/shared-token checks and separate Slack signature checks when their secrets are configured ([webhook auth](api/webhook_auth.py#L83), [Slack auth](api/webhook_auth.py#L108)).
 - Complete audit trail
-- Compliance with major standards
+- Advisory CIS/SOC2/PCI-labelled configuration checks, not compliance certification ([scanner dispatch](collectors/security_scanner.py#L280)).
 - Network isolation support
 - Org credential storage has no application-level encryption
 
@@ -575,9 +518,9 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 
 **Highly unlikely with proper configuration:**
 
-- API key authentication required
-- Webhook signature verification
-- IP whitelisting available
+- Webhook shared-secret checks require `WEBHOOK_SECRET`; general API-key authentication and RBAC are not implemented in the API ([webhook gate](api/server.py#L264), [API handlers](api/server.py#L304)).
+- Slack signature verification requires `SLACK_SIGNING_SECRET` ([Slack verifier](api/webhook_auth.py#L108)).
+- Configure IP filtering in the deployment network; the API has no IP allowlist middleware ([application setup and routes](api/server.py#L250)).
 - Deploy in private network
 - VPN/bastion access only
 - Regular security scanning
@@ -611,21 +554,12 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 
 ### Q4: Will fixes be accurate?
 
-**YES - 98.5% success rate.**
+**Fix verification reports target-check results; it does not establish a historical accuracy rate** ([verifier](tools/fix_verifier.py#L70)).
 
-- AI-powered analysis (Claude)
-- Multi-stage verification
-- Immediate testing
-- Stability monitoring
-- Automatic rollback on failure
-- Human review for complex issues
-
-**Quality assurance:**
-- Confidence scoring
-- Expected state validation
-- 5-minute stability check
-- Success rate tracking
-- Automatic documentation
+- Claude analysis uses collected context and tools ([agent API call](agent/core.py#L1199)).
+- Evidence checks validate final responses ([grounding](agent/grounding.py#L152)).
+- Actions classified as successful remediation on normal completion trigger immediate checks and, if those pass, a requested 300-second stability window ([agent finalization](agent/core.py#L1110), [verifier](tools/fix_verifier.py#L101)).
+- Results can be failed or unstable; they are recorded and reported through Slack without automatic rollback by this path ([verification outcomes](tools/fix_verifier.py#L101), [result handling](agent/core.py#L1124)).
 
 ---
 
@@ -702,10 +636,10 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 
 ⚠️ **Credential storage** - Plaintext JSON without application-level encryption
 ✅ **Safe** - Never deletes data, email before risk, complete audit
-✅ **Accurate** - 98.5% success rate, AI-powered, verified
-✅ **Compliant** - SOC2, ISO27001, CIS, NIST, GDPR, PCI-DSS
+✅ **Verification** - Immediate and stability checks report fix outcomes ([FixVerifier](tools/fix_verifier.py#L70)).
+✅ **Advisory scanning** - CIS/SOC2/PCI-labelled configuration findings ([SecurityScanner](collectors/security_scanner.py#L280)).
 ✅ **Transparent** - Complete audit trail, full documentation
-✅ **Reliable** - Automatic verification, rollback on failure
+✅ **Failure reporting** - Verification results saved and sent to Slack ([agent finalization](agent/core.py#L1124)).
 ✅ **Database optional** - No DB access by default; enable only after security review
 
 **The agent is production-ready for enterprise deployment.**
