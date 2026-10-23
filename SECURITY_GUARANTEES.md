@@ -208,14 +208,13 @@ def execute_command(command):
     # 3. Execute safely
     result = execute(command)
     
-    # 4. Verify success
-    verification = verify_fix()
-    
-    # 5. Document
+    # 4. Document
     generate_documentation()
     
     return result
 ```
+
+Fix verification is separate from per-command execution: the executor returns command status and output ([executor](tools/executor.py#L159)). At normal agent completion, `FixVerifier` runs only when `has_successful_remediation` classifies an action as successful remediation ([completion path](agent/core.py#L1096), [verification gate](agent/core.py#L1110)).
 
 ---
 
@@ -479,13 +478,11 @@ These findings do not establish SOC 2 Type II, ISO 27001, CIS, NIST CSF, GDPR, P
 
 **2. Emergency Stop:**
 ```bash
-# Manual emergency stop
-curl -X POST https://agent/emergency-stop \
-  -H "Authorization: Bearer $ADMIN_KEY"
-
-# Or via environment variable
+# Set in the environment used to start the agent service
 export AGENT_EMERGENCY_STOP=true
 ```
+
+The safety helper reads `AGENT_EMERGENCY_STOP` from the agent process environment ([flag reader](tools/safety.py#L63)). When active, the agent blocks tool names listed in `MUTATING_AGENT_TOOLS` before dispatch ([tool gate](tools/safety.py#L95), [agent dispatch](agent/core.py#L1427)). `GET /health` reports the current flag as `emergency_stop` ([health handler](api/server.py#L275)).
 
 **3. Investigation:**
 ```bash
@@ -624,7 +621,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 - Review: `docs/DEVSECOPS_GUIDE.md`
 
 **Security Incident?**
-- Emergency stop: `curl -X POST /emergency-stop`
+- Emergency stop: set `AGENT_EMERGENCY_STOP=true` in the environment used to start the agent service ([flag reader](tools/safety.py#L63)); check `emergency_stop` in `GET /health` ([health handler](api/server.py#L275)).
 - Email: security@company.com
 - Review audit logs immediately
 
