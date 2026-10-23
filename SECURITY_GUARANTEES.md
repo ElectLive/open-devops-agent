@@ -49,7 +49,7 @@ SLACK_SIGNING_SECRET=<slack-signing-secret>
 
 With `WEBHOOK_SECRET` set, webhook handlers check HMAC-SHA256 signatures or supported shared-token headers. Alertmanager and Grafana accept bearer tokens; GitLab accepts `X-Gitlab-Token`. These checks accept requests without authentication when the secret is unset ([webhook gate](api/server.py#L264), [Alertmanager/Grafana handlers](api/server.py#L468), [GitLab handler](api/server.py#L536), [verification functions](api/webhook_auth.py#L33)).
 
-Slack actions verify Slack signatures and request timestamps when `SLACK_SIGNING_SECRET` is configured; the check accepts requests when that secret is unset ([Slack handler](api/server.py#L668), [Slack verification](api/webhook_auth.py#L108)).
+Slack actions verify Slack signatures and request timestamps when `SLACK_SIGNING_SECRET` is configured; the check accepts requests when that secret is unset ([Slack handler](api/server.py#L678), [Slack verification](api/webhook_auth.py#L97)).
 
 **Layer 2: Authorization**
 
@@ -331,7 +331,7 @@ response = self._anthropic_client().messages.create(
 )
 ```
 
-The agent sends collected incident context and available organization documentation to Claude, then processes tool calls and final text ([context preparation](agent/core.py#L1052), [Claude API call](agent/core.py#L1199)).
+The agent sends collected incident context and available organization documentation to Claude, then processes tool calls and final text ([context preparation](agent/core.py#L1057), [Claude API call](agent/core.py#L1199)).
 
 **2. Evidence Checks:**
 
@@ -355,7 +355,7 @@ After immediate checks pass, `FixVerifier` repeats the same target checks over t
 
 **5. Failure Reporting and Rollback Tools:**
 
-The agent saves the verification result and sends a Slack message, using warning severity when verification fails. This completion path does not automatically roll back a failed or unstable fix ([result handling](agent/core.py#L1124)). Kubernetes, ArgoCD, and Helm rollback tools are separate actions available to the agent ([tool dispatch](agent/core.py#L1451), [ArgoCD dispatch](agent/core.py#L1530), [Helm dispatch](agent/core.py#L1550)).
+The agent saves the verification result and attempts a Slack notification when `SLACK_WEBHOOK_URL` is configured, using warning severity when verification fails ([result handling](agent/core.py#L1124), [notifier configuration check](tools/notify.py#L42)). Delivery is not guaranteed: the notifier logs exceptions from the HTTP POST and does not check the response status ([notifier request handling](tools/notify.py#L103)). This completion path does not automatically roll back a failed or unstable fix ([result handling](agent/core.py#L1124)). Kubernetes, ArgoCD, and Helm rollback tools are separate actions available to the agent ([tool dispatch](agent/core.py#L1451), [ArgoCD dispatch](agent/core.py#L1530), [Helm dispatch](agent/core.py#L1550)).
 
 ---
 
@@ -373,7 +373,7 @@ The agent saves the verification result and sends a Slack message, using warning
 
 **When Fix Fails:**
 - Failed immediate checks return `status="failed"`; failed stability monitoring returns `status="unstable"` ([verification results](tools/fix_verifier.py#L101)).
-- Verification results are saved and sent to Slack; the agent's result includes verification separately from `resolved` ([agent result handling](agent/core.py#L1124)).
+- Verification results are saved; a Slack notification is attempted when `SLACK_WEBHOOK_URL` is configured, without guaranteed delivery. The agent's result includes verification separately from `resolved` ([agent result handling](agent/core.py#L1124), [notifier configuration check](tools/notify.py#L42), [request handling](tools/notify.py#L103)).
 - Review the result before deciding on further remediation; automatic rollback is not part of this verification path ([agent finalization](agent/core.py#L1124)).
 
 ---
@@ -398,7 +398,7 @@ SLACK_SIGNING_SECRET=<slack-signing-secret>
 TLS_ENABLED=true
 ```
 
-Webhook and Slack authentication use these separate secrets; setting `API_KEY` does not protect API routes ([webhook gate](api/server.py#L264), [Slack verification](api/webhook_auth.py#L108), [API application](api/server.py#L250)).
+Webhook and Slack authentication use these separate secrets; setting `API_KEY` does not protect API routes ([webhook gate](api/server.py#L264), [Slack verification](api/webhook_auth.py#L97), [API application](api/server.py#L250)).
 
 `ENCRYPT_CREDENTIALS` is not read by the application and does not enable credential encryption.
 
@@ -508,7 +508,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 **YES.**
 
 - Enterprise-grade security
-- Webhook HMAC/shared-token checks and separate Slack signature checks when their secrets are configured ([webhook auth](api/webhook_auth.py#L83), [Slack auth](api/webhook_auth.py#L108)).
+- Webhook HMAC/shared-token checks and separate Slack signature checks when their secrets are configured ([webhook auth](api/webhook_auth.py#L83), [Slack auth](api/webhook_auth.py#L97)).
 - Complete audit trail
 - Advisory CIS/SOC2/PCI-labelled configuration checks, not compliance certification ([scanner dispatch](collectors/security_scanner.py#L280)).
 - Network isolation support
@@ -519,7 +519,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 **Highly unlikely with proper configuration:**
 
 - Webhook shared-secret checks require `WEBHOOK_SECRET`; general API-key authentication and RBAC are not implemented in the API ([webhook gate](api/server.py#L264), [API handlers](api/server.py#L304)).
-- Slack signature verification requires `SLACK_SIGNING_SECRET` ([Slack verifier](api/webhook_auth.py#L108)).
+- Slack signature verification requires `SLACK_SIGNING_SECRET` ([Slack verifier](api/webhook_auth.py#L97)).
 - Configure IP filtering in the deployment network; the API has no IP allowlist middleware ([application setup and routes](api/server.py#L250)).
 - Deploy in private network
 - VPN/bastion access only
@@ -542,7 +542,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 - Email sent before any risk
 - Manual approval required
 - Complete safety checks
-- Rollback on failure
+- Verification completion does not automatically roll back; Kubernetes, ArgoCD, and Helm rollback tools are separate agent actions ([completion path](agent/core.py#L1124), [Kubernetes](agent/core.py#L1451), [ArgoCD](agent/core.py#L1530), [Helm](agent/core.py#L1550)).
 - Full audit trail
 
 **Safe operations only:**
@@ -559,7 +559,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 - Claude analysis uses collected context and tools ([agent API call](agent/core.py#L1199)).
 - Evidence checks validate final responses ([grounding](agent/grounding.py#L152)).
 - Actions classified as successful remediation on normal completion trigger immediate checks and, if those pass, a requested 300-second stability window ([agent finalization](agent/core.py#L1110), [verifier](tools/fix_verifier.py#L101)).
-- Results can be failed or unstable; they are recorded and reported through Slack without automatic rollback by this path ([verification outcomes](tools/fix_verifier.py#L101), [result handling](agent/core.py#L1124)).
+- Results can be failed or unstable; they are recorded without automatic rollback by this path. A Slack notification is attempted when `SLACK_WEBHOOK_URL` is configured, without guaranteed delivery ([verification outcomes](tools/fix_verifier.py#L101), [result handling](agent/core.py#L1124), [notifier configuration check](tools/notify.py#L42), [request handling](tools/notify.py#L103)).
 
 ---
 
@@ -639,7 +639,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 ✅ **Verification** - Immediate and stability checks report fix outcomes ([FixVerifier](tools/fix_verifier.py#L70)).
 ✅ **Advisory scanning** - CIS/SOC2/PCI-labelled configuration findings ([SecurityScanner](collectors/security_scanner.py#L280)).
 ✅ **Transparent** - Complete audit trail, full documentation
-✅ **Failure reporting** - Verification results saved and sent to Slack ([agent finalization](agent/core.py#L1124)).
+✅ **Failure reporting** - Verification results saved; Slack notification attempted when `SLACK_WEBHOOK_URL` is configured, without guaranteed delivery ([agent finalization](agent/core.py#L1124), [notifier configuration check](tools/notify.py#L42), [request handling](tools/notify.py#L103)).
 ✅ **Database optional** - No DB access by default; enable only after security review
 
 **The agent is production-ready for enterprise deployment.**
