@@ -215,13 +215,11 @@ ipconfig /all
 - Re-run failed jobs (`POST /repos/{owner}/{repo}/actions/runs/{id}/rerun-failed-jobs`)
 
 **Setup:**
-```yaml
-# .github/workflows/notify-agent.yml
-- name: Notify Agent on Failure
-  if: failure()
-  run: |
-    curl -X POST $AGENT_URL/webhook \
-      -d '{"platform": "github", "event": "${{ github.event_name }}"}'
+```
+Repository Settings → Webhooks → Add webhook
+URL: $AGENT_URL/webhook/github
+Content type: application/json
+Events: Workflow runs
 ```
 
 ### GitLab CI/CD
@@ -233,20 +231,16 @@ ipconfig /all
 - Deployment tracking
 
 **Setup:**
-```yaml
-# .gitlab-ci.yml
-after_script:
-  - |
-    if [ "$CI_JOB_STATUS" = "failed" ]; then
-      curl -X POST $AGENT_URL/webhook \
-        -d '{"platform": "gitlab", "pipeline_id": "$CI_PIPELINE_ID"}'
-    fi
+```
+Project Settings → Webhooks → Add webhook
+URL: $AGENT_URL/webhook/gitlab
+Events: Pipeline events (agent handles failed pipelines)
 ```
 
 ### Jenkins
 
 **Capabilities:**
-- Webhook integration via notification plugin
+- Manual webhook ingress via `/webhook/manual`
 - Console log parsing
 - Build failure analysis
 - Plugin issue detection
@@ -257,7 +251,7 @@ after_script:
 // Jenkinsfile
 post {
   failure {
-    sh "curl -X POST $AGENT_URL/webhook -d '{\"platform\": \"jenkins\"}'"
+    sh "curl -X POST $AGENT_URL/webhook/manual -H 'Content-Type: application/json' -d '{\"type\": \"cicd\", \"labels\": {\"cicd_platform\": \"jenkins\"}}'"
   }
 }
 ```
@@ -384,7 +378,7 @@ data = await collector.collect({
 | Datadog | Webhook integration | Easy |
 | AWS CloudWatch | EventBridge + Lambda | Medium |
 | Azure Monitor | Action Group webhook | Easy |
-| PagerDuty | Webhook integration | Easy |
+| PagerDuty | Outgoing incident creation; incoming webhook not implemented | N/A for ingress |
 | Grafana | Alert notification channel | Easy |
 
 ### Prometheus/AlertManager
@@ -419,14 +413,14 @@ route:
 
 | Category | Tools | Integration |
 |----------|-------|-------------|
-| **Version Control** | GitHub, GitLab, Bitbucket | Webhook, API |
-| **CI/CD** | Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bamboo | Webhook, API |
-| **Container Registry** | Docker Hub, ECR, GCR, ACR | API access |
-| **Infrastructure as Code** | Terraform, CloudFormation, ARM templates | CLI integration |
-| **Configuration Management** | Ansible, Chef, Puppet | CLI integration |
-| **Service Mesh** | Istio, Linkerd | K8s API |
-| **API Gateway** | Kong, Ambassador, Nginx | Config analysis |
-| **Secrets Management** | Vault, AWS Secrets Manager, Azure Key Vault | API access |
+| **Version Control** | GitHub, GitLab, Bitbucket Cloud | Built-in PR/MR webhooks and API tools |
+| **CI/CD** | Jenkins, GitHub Actions, GitLab CI, Azure DevOps, Bamboo | Built-in API log collectors and retry/rebuild tools; failure webhooks for GitHub Actions and GitLab CI; manual webhook ingress for Jenkins, Azure DevOps and Bamboo |
+| **Container Registry** | Docker Hub, ECR, GCR, Artifact Registry, ACR | Built-in ECR/Artifact Registry/ACR collectors; no dedicated Docker Hub or GCR API client |
+| **Infrastructure as Code** | Terraform, CloudFormation, ARM templates | Built-in Terraform validate/plan CLI tools; no dedicated CloudFormation or ARM template tools |
+| **Configuration Management** | Ansible, Chef, Puppet | No dedicated collectors or tools |
+| **Service Mesh** | Istio, Linkerd | Generic Kubernetes pod/log/event diagnostics; no mesh-specific collector or tool |
+| **API Gateway** | Kong, Ambassador, Nginx | Built-in Nginx diagnostics/configuration/reload tools; no dedicated Kong or Ambassador integration |
+| **Secrets Management** | Vault, AWS Secrets Manager, Azure Key Vault | No dedicated secret-store API integration |
 
 ---
 

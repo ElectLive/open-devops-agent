@@ -757,7 +757,8 @@ Events: Workflow runs
 
 #### PagerDuty
 
-Use the Generic Webhooks integration pointing to `/webhook/pagerduty`
+PagerDuty supports outgoing incident creation when configured with `PAGERDUTY_ENABLED=true`, `PAGERDUTY_TOKEN`, `PAGERDUTY_SERVICE_ID`, and `PAGERDUTY_FROM_EMAIL`.
+Incoming PagerDuty webhooks are not implemented; `/webhook/pagerduty` is not registered.
 
 ---
 
