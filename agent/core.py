@@ -5,6 +5,7 @@ Uses Claude's tool_use to reason, decide, and act on infrastructure incidents.
 import base64
 import json
 import os
+import re
 import shlex
 import sys
 import time
@@ -29,6 +30,7 @@ from collectors.gitlab import GitLabCollector
 from collectors.jenkins import JenkinsCollector
 from collectors.bamboo import BambooCollector
 from collectors.azure_devops import AzureDevOpsCollector
+from collectors.docker import parse_build_error
 from collectors.argocd import ArgoCDCollector
 from collectors.helm import HelmCollector
 from collectors.aws import AWSCollector
@@ -1291,6 +1293,23 @@ class DevOpsAgent:
                     enriched["ci_logs"] = await self.azure_devops_collector.collect(
                         context["project"], context["pipeline_id"], context.get("run_id")
                     )
+
+                ci_logs = enriched.get("ci_logs", {})
+                log_entries = (
+                    ci_logs.get("failed_jobs", [])
+                    + ci_logs.get("failed_tasks", [])
+                    + [ci_logs]
+                )
+                for entry in log_entries:
+                    log_text = (
+                        entry.get("logs") or entry.get("console_log") or entry.get("build_log") or ""
+                    )
+                    if not re.search(r"^Step \d+(?:/\d+)?[ \t]*:", log_text, re.MULTILINE):
+                        continue
+                    build_error = parse_build_error(scrub_text(log_text))
+                    if build_error["errors"]:
+                        enriched["docker_build_error"] = build_error
+                        break
             elif issue_type == "argocd" and context.get("app_name"):
                 enriched["argocd_data"] = await self.argocd_collector.collect(context["app_name"])
             elif issue_type == "helm" and context.get("release_name"):
