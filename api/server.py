@@ -21,6 +21,7 @@ from pydantic import BaseModel
 
 from agent.core import DevOpsAgent
 from agent.classifier import classify_issue
+from api.api_auth import api_auth_disabled, require_org_access
 from api.webhook_auth import (
     bearer_token,
     get_webhook_secret,
@@ -222,6 +223,10 @@ async def enqueue_incident(context: dict, incident_id: Optional[str] = None) -> 
 async def lifespan(app: FastAPI):
     global _queue_worker_task, _retention_task, _background_lock_handle, _queue_running
     log.info("DevOps AI Agent starting", auto_apply=os.getenv("AUTO_APPLY", "false"))
+    if api_auth_disabled():
+        log.warning(
+            "API_AUTH_DISABLED=true: org config, docs and audit endpoints are unauthenticated"
+        )
     _background_lock_handle = acquire_background_worker_lock()
     try:
         incident_queue.adopt_legacy_reviews()
@@ -285,9 +290,14 @@ async def health():
 
 
 @app.get("/audit")
-async def get_audit(org_id: Optional[str] = None, limit: int = 50):
+async def get_audit(
+    org_id: Optional[str] = None,
+    limit: int = 50,
+    authorization: Optional[str] = Header(None),
+):
     """Return recent incident audit log from cloud storage (org-scoped)."""
     org = org_id or os.getenv("ORG_ID", "default")
+    require_org_access(org, authorization)
     events = incident_store.list_audit(org, limit=limit)
     return {"org_id": org, "events": events, "total": len(events)}
 
@@ -302,21 +312,28 @@ class OrgConfigBody(BaseModel):
 
 
 @app.put("/orgs/{org_id}/config")
-async def save_org_config(org_id: str, body: OrgConfigBody):
+async def save_org_config(
+    org_id: str, body: OrgConfigBody, authorization: Optional[str] = Header(None)
+):
     """Store org-owned API keys and integrations (BYOK — not platform operator keys)."""
+    require_org_access(org_id, authorization)
     result = org_config.save(org_id, body.credentials)
     return {"status": "saved", **result}
 
 
 @app.get("/orgs/{org_id}/config/status")
-async def org_config_status(org_id: str):
+async def org_config_status(org_id: str, authorization: Optional[str] = Header(None)):
     """Which credentials are configured for this org (values never returned)."""
+    require_org_access(org_id, authorization)
     return org_config.status(org_id)
 
 
 @app.post("/orgs/{org_id}/docs")
-async def upload_doc_text(org_id: str, body: DocUploadBody):
+async def upload_doc_text(
+    org_id: str, body: DocUploadBody, authorization: Optional[str] = Header(None)
+):
     """Upload org documentation (runbooks, policies, playbooks) as text."""
+    require_org_access(org_id, authorization)
     try:
         key = org_docs.upload(org_id, body.path, body.content)
         return {"status": "uploaded", "org_id": org_id, "path": body.path, "storage_key": key}
@@ -329,8 +346,10 @@ async def upload_doc_file(
     org_id: str,
     path: str,
     file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
 ):
     """Upload org documentation from a file."""
+    require_org_access(org_id, authorization)
     content = (await file.read()).decode("utf-8")
     try:
         key = org_docs.upload(org_id, path, content, file.content_type or "text/plain")
@@ -340,14 +359,20 @@ async def upload_doc_file(
 
 
 @app.get("/orgs/{org_id}/docs")
-async def list_org_docs(org_id: str, prefix: str = ""):
+async def list_org_docs(
+    org_id: str, prefix: str = "", authorization: Optional[str] = Header(None)
+):
     """List org documentation files."""
+    require_org_access(org_id, authorization)
     return {"org_id": org_id, "docs": org_docs.list_docs(org_id, prefix)}
 
 
 @app.get("/orgs/{org_id}/docs/{doc_path:path}")
-async def get_org_doc(org_id: str, doc_path: str):
+async def get_org_doc(
+    org_id: str, doc_path: str, authorization: Optional[str] = Header(None)
+):
     """Retrieve a single org documentation file."""
+    require_org_access(org_id, authorization)
     content = org_docs.get(org_id, doc_path)
     if content is None:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -355,7 +380,10 @@ async def get_org_doc(org_id: str, doc_path: str):
 
 
 @app.delete("/orgs/{org_id}/docs/{doc_path:path}")
-async def delete_org_doc(org_id: str, doc_path: str):
+async def delete_org_doc(
+    org_id: str, doc_path: str, authorization: Optional[str] = Header(None)
+):
+    require_org_access(org_id, authorization)
     if not org_docs.delete(org_id, doc_path):
         raise HTTPException(status_code=404, detail="Document not found")
     return {"status": "deleted", "org_id": org_id, "path": doc_path}

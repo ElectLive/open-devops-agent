@@ -33,7 +33,7 @@ Upload runbooks so Claude sees them on every incident for that org.
 **Upload:**
 
 ```bash
-curl -X POST "http://localhost:8000/orgs/acme-corp/docs/upload?path=runbooks/helm-rollback.md" \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST "http://localhost:8000/orgs/acme-corp/docs/upload?path=runbooks/helm-rollback.md" \
   -H "X-Org-ID: acme-corp" \
   -F "file=@helm-rollback.md"
 ```

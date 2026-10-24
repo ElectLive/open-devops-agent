@@ -315,7 +315,7 @@ Alerts and notifications go to **their** Slack. API calls use **their** tokens. 
 When multiple orgs share one webhook/API server, each org registers their own keys:
 
 ```bash
-curl -X PUT http://localhost:8000/orgs/acme-corp/config \
+curl -H "Authorization: Bearer $API_TOKEN" -X PUT http://localhost:8000/orgs/acme-corp/config \
   -H "Content-Type: application/json" \
   -d '{
     "credentials": {
@@ -325,10 +325,12 @@ curl -X PUT http://localhost:8000/orgs/acme-corp/config \
     }
   }'
 
-curl http://localhost:8000/orgs/acme-corp/config/status
+curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8000/orgs/acme-corp/config/status
 ```
 
 Credentials are stored at `{org_id}/config/credentials.json` in org-scoped storage and applied per request — org A never uses org B's keys.
+
+`$API_TOKEN` is either the platform's `API_ADMIN_TOKEN` (any org) or that org's token from `API_ORG_TOKENS` (`acme-corp=...`), which can only read or write `acme-corp`. The org config, docs and audit routes return **503** until one of them is set; see [API authentication](docs/API_REFERENCE.md#authentication).
 
 ### Fix Verification
 
@@ -598,7 +600,7 @@ curl -X POST http://localhost:8000/webhook/manual \
   }'
 
 # Wait ~30s, then check org-scoped audit log
-curl "http://localhost:8000/audit?org_id=acme-corp"
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp"
 ```
 
 ### API Documentation & Testing
@@ -795,7 +797,7 @@ curl http://localhost:8000/health
 All agent decisions are stored per organization in cloud storage (or in-memory for dev):
 
 ```bash
-curl "http://localhost:8000/audit?org_id=acme-corp" | jq '.'
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp" | jq '.'
 ```
 
 Each entry includes diagnosis, actions taken, grounding validation, escalation status, and duration.

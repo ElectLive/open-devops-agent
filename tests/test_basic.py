@@ -45,14 +45,17 @@ async def test_health_endpoint_structure():
 
 
 @pytest.mark.asyncio
-async def test_audit_endpoint_structure():
+async def test_audit_endpoint_structure(monkeypatch):
     """Test that audit endpoint returns expected structure"""
     try:
         from api.server import app
         from fastapi.testclient import TestClient
-        
+
+        monkeypatch.setenv("API_ADMIN_TOKEN", "test-admin-token")
         client = TestClient(app)
-        response = client.get("/audit")
+        response = client.get(
+            "/audit", headers={"Authorization": "Bearer test-admin-token"}
+        )
         
         assert response.status_code == 200
         data = response.json()

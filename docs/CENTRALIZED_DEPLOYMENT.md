@@ -242,7 +242,7 @@ curl -X POST $AGENT/webhook/manual \
   -H "X-Org-ID: acme-corp" \
   -d "{\"type\":\"server\",\"host\":\"$TARGET\",\"service\":\"broken-app\",\"description\":\"Docker crash loop on EC2\"}"
 
-curl "$AGENT/audit?org_id=acme-corp"
+curl -H "Authorization: Bearer $API_TOKEN" "$AGENT/audit?org_id=acme-corp"
 ```
 
 ---

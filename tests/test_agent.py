@@ -2,6 +2,8 @@
 Tests for DevOps AI Agent
 Run: pytest tests/ -v
 """
+import os
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -322,7 +324,10 @@ class TestVerificationAuditAndStability:
                 {"incident_id": "INC-AUDIT-1", "org_id": "test-org"},
                 "INC-AUDIT-1", "test-org", {"type": "k8s", "org_id": "test-org"}, None,
             )
-            response = await server.get_audit(org_id="test-org")
+            with patch.dict(os.environ, {"API_ADMIN_TOKEN": "test-admin-token"}):
+                response = await server.get_audit(
+                    org_id="test-org", authorization="Bearer test-admin-token"
+                )
 
         assert response["total"] == 1
         assert response["events"][0].get("verification") == verification

@@ -109,7 +109,7 @@ curl http://localhost:8000/health
 Upload an org runbook (loaded into agent context during incidents):
 
 ```bash
-curl -X POST http://localhost:8000/orgs/acme-corp/docs \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST http://localhost:8000/orgs/acme-corp/docs \
   -H "Content-Type: application/json" \
   -d '{
     "path": "runbooks/k8s-oom.md",
@@ -141,7 +141,7 @@ curl -X POST http://localhost:8000/webhook/manual \
 
 ```bash
 # View org-scoped audit log (poll after queuing — processing is async)
-curl "http://localhost:8000/audit?org_id=acme-corp" | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp" | python3 -m json.tool
 
 # Or run the automated test script
 ./scripts/test_api_flow.sh

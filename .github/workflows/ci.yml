@@ -300,6 +300,7 @@ jobs:
           sleep 5
         env:
           TESTING: true
+          API_ADMIN_TOKEN: ci-admin-token
 
       - name: Test Health Endpoint
         run: |
@@ -394,8 +395,13 @@ jobs:
 
       - name: Check Audit Endpoint
         run: |
-          curl -f http://localhost:8000/audit || exit 1
-          echo "✓ Audit endpoint test passed"
+          status=$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:8000/audit)
+          if [ "$status" != "401" ]; then
+            echo "::error::Unauthenticated /audit returned HTTP $status, expected 401"
+            exit 1
+          fi
+          curl -f -H "Authorization: Bearer ci-admin-token" http://localhost:8000/audit || exit 1
+          echo "✓ Audit endpoint requires a token and works with one"
 
   security-scan:
     name: Security Scan

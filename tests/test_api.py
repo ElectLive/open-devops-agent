@@ -14,8 +14,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+ADMIN_TOKEN = "test-admin-token"
+AUTH = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+
+
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("API_ADMIN_TOKEN", ADMIN_TOKEN)
+    monkeypatch.delenv("API_ORG_TOKENS", raising=False)
+    monkeypatch.delenv("API_AUTH_DISABLED", raising=False)
     with (
         patch("agent.core.DevOpsAgent"),
         patch("tools.notify.SlackNotifier"),
@@ -46,7 +53,7 @@ def test_health_returns_200(client):
 # ─── /audit ──────────────────────────────────────────────────────────────────
 
 def test_audit_returns_200(client):
-    resp = client.get("/audit")
+    resp = client.get("/audit", headers=AUTH)
     assert resp.status_code == 200
     assert isinstance(resp.json(), (list, dict))
 
@@ -130,20 +137,21 @@ def test_upload_doc_text_returns_200(client):
     resp = client.post(
         "/orgs/test-org/docs",
         json={"path": "runbooks/restart.md", "content": "# Restart runbook"},
+        headers=AUTH,
     )
     assert resp.status_code == 200
 
 
 def test_list_org_docs_returns_200(client):
-    resp = client.get("/orgs/test-org/docs")
+    resp = client.get("/orgs/test-org/docs", headers=AUTH)
     assert resp.status_code == 200
 
 
 def test_get_org_doc_missing_returns_404(client):
-    resp = client.get("/orgs/test-org/docs/nonexistent/path.md")
+    resp = client.get("/orgs/test-org/docs/nonexistent/path.md", headers=AUTH)
     assert resp.status_code in (404, 200)
 
 
 def test_delete_org_doc_returns_200_or_404(client):
-    resp = client.delete("/orgs/test-org/docs/runbooks/restart.md")
+    resp = client.delete("/orgs/test-org/docs/runbooks/restart.md", headers=AUTH)
     assert resp.status_code in (200, 404)

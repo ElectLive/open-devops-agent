@@ -113,7 +113,7 @@ curl -X POST http://localhost:8000/webhook/manual \
   -d '{"type": "k8s", "namespace": "default", "pod": "missing-pod-xyz"}'
 
 # Wait for processing, then check audit:
-curl "http://localhost:8000/audit?org_id=acme-corp" | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp" | python3 -m json.tool
 # Look for "escalated": true
 ```
 

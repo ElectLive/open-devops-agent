@@ -16,7 +16,7 @@
 - The six host-mutating tools require approval for live changes when `AUTO_APPLY=false`; dry runs remain available.
 - Org credentials stored without application-level encryption
 - API keys never logged
-- API access has no application-level RBAC; organization configuration handlers accept the supplied org ID without a role check ([API handlers](api/server.py#L304)).
+- Org config, docs and audit routes require a bearer token: `API_ADMIN_TOKEN` (all orgs) or a per-org token from `API_ORG_TOKENS` (its own org only). They fail closed with 503 when no token is configured ([api/api_auth.py](api/api_auth.py)). There are no finer-grained roles.
 
 **Code Security:**
 - No shell injection vulnerabilities
@@ -53,7 +53,7 @@ Slack actions verify Slack signatures and request timestamps when `SLACK_SIGNING
 
 **Layer 2: Authorization**
 
-The API has no role-based authorization or general API-key authentication middleware. Organization IDs select stored data; they are not checked against a caller's permissions. Protect API access with deployment-level access controls ([application setup and org handlers](api/server.py#L250), [org document handlers](api/server.py#L317)).
+Org config, docs and audit routes check a bearer token against `API_ADMIN_TOKEN` (every org) or the caller's org token in `API_ORG_TOKENS`; a token for one org gets 403 on another, and the routes return 503 when no token is configured ([api/api_auth.py](api/api_auth.py)). There are no finer-grained roles, and the MCP network transports are not yet covered (#116). Keep deployment-level access controls in place as well.
 
 **Layer 3: Encryption**
 
@@ -392,12 +392,14 @@ ENABLE_EMAIL_ALERTS=true
 # Set up authentication
 WEBHOOK_SECRET=<strong-secret>
 SLACK_SIGNING_SECRET=<slack-signing-secret>
+API_ADMIN_TOKEN=<strong-random-token>
+API_ORG_TOKENS=acme-corp=<token-a>
 
 # Configure encryption
 TLS_ENABLED=true
 ```
 
-Webhook and Slack authentication use these separate secrets; setting `API_KEY` does not protect API routes ([webhook gate](api/server.py#L264), [Slack verification](api/webhook_auth.py#L97), [API application](api/server.py#L250)).
+Webhook and Slack authentication use these separate secrets; the management API uses `API_ADMIN_TOKEN` / `API_ORG_TOKENS` (setting `API_KEY` does nothing) ([webhook gate](api/server.py#L264), [Slack verification](api/webhook_auth.py#L97), [API application](api/server.py#L250)).
 
 `ENCRYPT_CREDENTIALS` is not read by the application and does not enable credential encryption.
 
@@ -515,7 +517,7 @@ jq '.timestamp > "2026-06-12T12:00:00Z"' audit.log
 
 **Highly unlikely with proper configuration:**
 
-- Webhook shared-secret checks require `WEBHOOK_SECRET`; general API-key authentication and RBAC are not implemented in the API ([webhook gate](api/server.py#L264), [API handlers](api/server.py#L304)).
+- Webhook shared-secret checks require `WEBHOOK_SECRET`; the management API requires `API_ADMIN_TOKEN` or a per-org `API_ORG_TOKENS` token; there is no finer-grained RBAC ([webhook gate](api/server.py#L264), [API handlers](api/server.py#L304)).
 - Slack signature verification requires `SLACK_SIGNING_SECRET` ([Slack verifier](api/webhook_auth.py#L97)).
 - Configure IP filtering in the deployment network; the API has no IP allowlist middleware ([application setup and routes](api/server.py#L250)).
 - Deploy in private network

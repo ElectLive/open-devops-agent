@@ -289,7 +289,7 @@ curl -X POST http://localhost:8000/webhook/manual \
 **View audit log** (poll after ~30s — processing is async):
 
 ```bash
-curl "http://localhost:8000/audit?org_id=acme-corp"
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp"
 ```
 
 **API docs & Postman:** See [API_REFERENCE.md](API_REFERENCE.md), [API_TESTING.md](API_TESTING.md), and `postman/` folder.

@@ -10,12 +10,35 @@ All incident data is **org-scoped** and stored in cloud object storage (S3, MinI
 
 | Endpoint group | Auth |
 |----------------|------|
-| `/health`, `/audit` | None (restrict in production via network policy) |
-| `/orgs/*` | None by default — add API gateway auth in production |
+| `/health` | None (liveness probe) |
+| `/audit`, `/orgs/{org_id}/config*`, `/orgs/{org_id}/docs*` | `Authorization: Bearer <token>`: `API_ADMIN_TOKEN` (any org) or the org's own token from `API_ORG_TOKENS`. See [Management API tokens](#management-api-tokens) |
 | `/webhook/github` | `X-Hub-Signature-256` when `WEBHOOK_SECRET` is set |
 | `/webhook/manual` | `X-Hub-Signature-256` **or** `X-Webhook-Signature` when `WEBHOOK_SECRET` is set |
 | `/webhook/alertmanager`, `/webhook/grafana` | HMAC signature as above, **or** `Authorization: Bearer <WEBHOOK_SECRET>` (Alertmanager and Grafana cannot sign bodies) |
 | `/slack/action` | `X-Slack-Signature` + `X-Slack-Request-Timestamp` when `SLACK_SIGNING_SECRET` is set (configured in Slack app settings) |
+
+### Management API tokens
+
+```bash
+API_ADMIN_TOKEN=<long random string>                 # platform operator: every org
+API_ORG_TOKENS=acme-corp=<token-a>,globex=<token-b>  # each token: only its own org
+```
+
+```bash
+curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8000/orgs/acme-corp/config/status
+```
+
+| Situation | Response |
+|---|---|
+| No `API_ADMIN_TOKEN` and no `API_ORG_TOKENS` configured | **503**: the API fails closed |
+| Missing, malformed (not `Bearer`) or unknown token | **401** with `WWW-Authenticate: Bearer` |
+| Valid org token used for a different org | **403** |
+| Admin token, or the org's own token | Handled normally |
+
+`API_AUTH_DISABLED=true` turns these checks off for local development (a warning is logged at
+startup). For `/audit` the org is `org_id` from the query string, or `ORG_ID` when omitted.
+Tokens are compared in constant time. The MCP server's network transports are not covered by these
+tokens yet (see issue #116).
 
 `X-Org-ID` is **not** authentication — it only selects the organization (see
 [Org scoping](#org-scoping)) and is optional on every webhook.
@@ -202,7 +225,7 @@ Upload documentation from a file (multipart form).
 **Example:**
 
 ```bash
-curl -X POST "http://localhost:8000/orgs/acme-corp/docs/upload?path=runbooks/k8s-oom.md" \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST "http://localhost:8000/orgs/acme-corp/docs/upload?path=runbooks/k8s-oom.md" \
   -F "file=@./runbooks/k8s-oom.md"
 ```
 
