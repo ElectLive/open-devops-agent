@@ -157,7 +157,7 @@ curl http://$PUBLIC_IP:8000/health
 ## Part 4: Upload org runbook (optional but helps)
 
 ```bash
-curl -X POST http://$PUBLIC_IP:8000/orgs/acme-corp/docs \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST http://$PUBLIC_IP:8000/orgs/acme-corp/docs \
   -H "Content-Type: application/json" \
   -d '{
     "path": "runbooks/docker-restart-loop.md",
@@ -240,7 +240,7 @@ curl -X POST http://localhost:8000/webhook/manual \
 ### Poll audit log (~30–90 seconds)
 
 ```bash
-curl -s "http://$PUBLIC_IP:8000/audit?org_id=acme-corp" | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" -s "http://$PUBLIC_IP:8000/audit?org_id=acme-corp" | python3 -m json.tool
 ```
 
 Look for:

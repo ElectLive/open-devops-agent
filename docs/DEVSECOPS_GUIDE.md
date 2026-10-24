@@ -588,7 +588,7 @@ kubectl scale deployment devops-agent --replicas=0
 kubectl logs deployment/devops-agent > agent-forensics.log
 
 # 3. Review audit trail
-curl https://agent.company.com/audit > audit-trail.json
+curl -H "Authorization: Bearer $API_TOKEN" https://agent.company.com/audit > audit-trail.json
 
 # 4. Investigate
 grep "CRITICAL" audit-trail.json

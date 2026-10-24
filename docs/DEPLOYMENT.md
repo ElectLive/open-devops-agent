@@ -529,7 +529,7 @@ curl -X POST https://your-agent.com/webhook/manual \
 kubectl get configmap agent-config -n devops-agent -o yaml
 
 # Review audit log
-curl https://your-agent.com/audit
+curl -H "Authorization: Bearer $API_TOKEN" https://your-agent.com/audit
 
 # Check approval channel in Slack
 ```

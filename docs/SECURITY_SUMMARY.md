@@ -226,10 +226,10 @@ export AGENT_EMERGENCY_STOP=true
 
 ```bash
 # View all blocked operations
-curl https://agent.company.com/audit | jq '.[] | select(.action_type == "dangerous_operation_blocked")'
+curl -H "Authorization: Bearer $API_TOKEN" https://agent.company.com/audit | jq '.[] | select(.action_type == "dangerous_operation_blocked")'
 
 # Check email notification status
-curl https://agent.company.com/audit | jq '.[] | select(.email_sent == false)'
+curl -H "Authorization: Bearer $API_TOKEN" https://agent.company.com/audit | jq '.[] | select(.email_sent == false)'
 
 # Security findings
 curl https://agent.company.com/security/findings

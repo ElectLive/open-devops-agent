@@ -95,7 +95,7 @@ Expected:
 ### Test 2: Upload org runbook
 
 ```bash
-curl -s -X POST http://localhost:8000/orgs/acme-corp/docs \
+curl -H "Authorization: Bearer $API_TOKEN" -s -X POST http://localhost:8000/orgs/acme-corp/docs \
   -H "Content-Type: application/json" \
   -d '{
     "path": "runbooks/k8s-oom.md",
@@ -106,13 +106,13 @@ curl -s -X POST http://localhost:8000/orgs/acme-corp/docs \
 Verify listed:
 
 ```bash
-curl -s "http://localhost:8000/orgs/acme-corp/docs?prefix=runbooks" | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" -s "http://localhost:8000/orgs/acme-corp/docs?prefix=runbooks" | python3 -m json.tool
 ```
 
 Verify content:
 
 ```bash
-curl -s http://localhost:8000/orgs/acme-corp/docs/runbooks/k8s-oom.md | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" -s http://localhost:8000/orgs/acme-corp/docs/runbooks/k8s-oom.md | python3 -m json.tool
 ```
 
 ---
@@ -122,7 +122,7 @@ curl -s http://localhost:8000/orgs/acme-corp/docs/runbooks/k8s-oom.md | python3 
 ```bash
 echo "# Server Runbook\nCheck disk with df -h" > /tmp/server-runbook.md
 
-curl -s -X POST "http://localhost:8000/orgs/acme-corp/docs/upload?path=runbooks/server-disk.md" \
+curl -H "Authorization: Bearer $API_TOKEN" -s -X POST "http://localhost:8000/orgs/acme-corp/docs/upload?path=runbooks/server-disk.md" \
   -F "file=@/tmp/server-runbook.md" | python3 -m json.tool
 ```
 
@@ -178,7 +178,7 @@ curl -s -X POST http://localhost:8000/webhook/alertmanager \
 Wait 30–60 seconds for the queue worker, then:
 
 ```bash
-curl -s "http://localhost:8000/audit?org_id=acme-corp&limit=10" | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" -s "http://localhost:8000/audit?org_id=acme-corp&limit=10" | python3 -m json.tool
 ```
 
 Look for your `incident_id` in the `events` array. Each entry includes:
@@ -209,7 +209,7 @@ curl -s -X POST http://localhost:8000/webhook/manual \
 ### Test 8: Delete org doc
 
 ```bash
-curl -s -X DELETE http://localhost:8000/orgs/acme-corp/docs/runbooks/server-disk.md | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" -s -X DELETE http://localhost:8000/orgs/acme-corp/docs/runbooks/server-disk.md | python3 -m json.tool
 ```
 
 ---

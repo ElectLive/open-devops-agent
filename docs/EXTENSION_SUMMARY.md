@@ -272,7 +272,7 @@ curl -X POST http://localhost:8000/webhook/manual \
 
 ```bash
 # View audit log
-curl http://localhost:8000/audit
+curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8000/audit
 
 # Check health
 curl http://localhost:8000/health

@@ -248,7 +248,7 @@ chmod +x scripts/verify_setup.sh
 ./scripts/verify_setup.sh
 
 # 3. Upload an org runbook (optional)
-curl -X POST http://localhost:8000/orgs/acme-corp/docs \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST http://localhost:8000/orgs/acme-corp/docs \
   -H "Content-Type: application/json" \
   -d '{"path":"runbooks/test.md","content":"# Test runbook"}'
 
@@ -264,7 +264,7 @@ curl -X POST http://localhost:8000/webhook/manual \
 # Expected: {"status":"queued","incident_id":"INC-..."}
 
 # 5. Poll org-scoped audit log (wait ~30s after step 4)
-curl "http://localhost:8000/audit?org_id=acme-corp"
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp"
 
 # 6. Or run automated API test
 ./scripts/test_api_flow.sh
@@ -351,7 +351,7 @@ Requires SSH from agent server → target EC2. See [docs/CENTRALIZED_DEPLOYMENT.
 ### Upload runbooks
 
 ```bash
-curl -X POST http://localhost:8000/orgs/acme-corp/docs \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST http://localhost:8000/orgs/acme-corp/docs \
   -H "Content-Type: application/json" \
   -d '{
     "path": "runbooks/nginx-502.md",
@@ -1635,7 +1635,7 @@ STORAGE_BUCKET=devops-agent
 ### 2. Upload org runbooks
 
 ```bash
-curl -X POST http://$AGENT_URL/orgs/acme-corp/docs \
+curl -H "Authorization: Bearer $API_TOKEN" -X POST http://$AGENT_URL/orgs/acme-corp/docs \
   -H "Content-Type: application/json" \
   -d '{"path":"runbooks/k8s-oom.md","content":"# OOM runbook\n..."}'
 ```
@@ -1681,13 +1681,13 @@ Trigger with `"host": "ubuntu@target-ec2-ip"` in webhook body.
 
 ```bash
 # Org-scoped audit (persistent in cloud storage)
-curl "http://localhost:8000/audit?org_id=acme-corp" | python3 -m json.tool
+curl -H "Authorization: Bearer $API_TOKEN" "http://localhost:8000/audit?org_id=acme-corp" | python3 -m json.tool
 
 # Agent process logs
 tail -f logs/agent.log
 
 # List uploaded org docs
-curl http://localhost:8000/orgs/acme-corp/docs
+curl -H "Authorization: Bearer $API_TOKEN" http://localhost:8000/orgs/acme-corp/docs
 ```
 
 ---
